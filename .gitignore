@@ -1,3 +1,23 @@
 .vscode
 
 .DS_Store
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local ROS/process diagnostics and generated perception artifacts
+diagnostics/
+scene_analysis/**
+!scene_analysis/
+!scene_analysis/*.py
+
+# Downloaded/extracted challenge scenes are large runtime assets, not source.
+experiments/scenes/
+
+# Local model traces, snapshots, and rendered experiment images
+experiments/nav/*_snap*/
+experiments/nav/timing_snap/
+experiments/nav/*.json
+experiments/japanese_room/*.png
+experiments/sam3/*.png
