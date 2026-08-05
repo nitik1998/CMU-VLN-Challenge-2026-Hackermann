@@ -22,7 +22,7 @@ from geometry_msgs.msg import PointStamped, Pose2D
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool
 
-ARRIVE_R = 0.35          # system's waypointXYRadius is 0.3; stay looser
+ARRIVE_R = 0.15          # match waypointConverter; do not stop global routing early
 STUCK_S = 14.0           # no progress for this long -> report stuck.
                          # 8 s was too impatient: threading between office
                          # chairs is slow, and with goal_adjust_radius
@@ -53,8 +53,7 @@ class FarBridge(Node):
         self.pos = (m.pose.pose.position.x, m.pose.pose.position.y)
 
     def on_reached(self, m):
-        if m.data:
-            self.reached = True
+        self.reached = bool(m.data)
 
     def on_route(self, m):
         """Forward FAR's next-hop as the challenge-interface waypoint."""
@@ -87,9 +86,14 @@ class FarBridge(Node):
                 self.last_prog_p = self.pos
             if math.dist(self.pos, self.last_prog_p) > STUCK_D:
                 self.last_prog_p, self.last_prog_t = self.pos, time.time()
-            if self.goal and math.dist(self.pos, self.goal) < ARRIVE_R:
+            goal_distance = (math.dist(self.pos, self.goal)
+                             if self.goal else float("inf"))
+            if goal_distance < ARRIVE_R:
                 return "arrived", self.pos
-            if self.reached:
+            # /far_reach_goal_status can be transient-local from the previous
+            # trip. Never accept that stale semantic flag while geometry says the
+            # robot is still far from this command's goal.
+            if self.reached and goal_distance <= 0.30:
                 return "far_reports_goal_reached", self.pos
             if time.time() - self.last_prog_t > STUCK_S:
                 return "stuck", self.pos

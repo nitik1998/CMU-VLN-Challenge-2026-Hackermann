@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """SAM3 as a subordinate visual-localization tool for the Qwen investigator.
 
-Qwen supplies text queries and optional panorama sectors. SAM returns proposals,
+Qwen supplies text queries. SAM returns proposals,
 marked images, and enlarged contextual crops. It never decides object identity,
 the count, navigation, or whether exploration is complete.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import numpy as np
@@ -23,17 +22,6 @@ def _iou(a: list[float], b: list[float]) -> float:
     area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
     area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
     return intersection / max(1e-6, area_a + area_b - intersection)
-
-
-def _sectors(text: str) -> set[int]:
-    values = {int(v) for v in re.findall(r"\bS\s*(\d{1,2})\b", text, re.I)
-              if 0 <= int(v) <= 11}
-    for first, last in re.findall(
-            r"\bS\s*(\d{1,2})\s*[-–—]\s*S?\s*(\d{1,2})\b", text, re.I):
-        lo, hi = sorted((int(first), int(last)))
-        if 0 <= lo <= hi <= 11:
-            values.update(range(lo, hi + 1))
-    return values
 
 
 class SAMAssistant:
@@ -81,9 +69,7 @@ class SAMAssistant:
             query = str(request.get("query", "")).strip()[:120]
             if not query:
                 continue
-            requested_sectors = _sectors(str(request.get("sector", "")))
-            print(f"[SAM assistant] Qwen asks: {query!r} "
-                  f"in {sorted(requested_sectors) or 'all sectors'}", flush=True)
+            print(f"[SAM assistant] Qwen asks: {query!r}", flush=True)
             text = self.processor(text=query, return_tensors="pt").to(self.device)
             with torch.inference_mode():
                 text_features = self.model.get_text_features(
@@ -104,17 +90,16 @@ class SAMAssistant:
             for index in order.tolist():
                 box = [round(float(v), 1)
                        for v in result["boxes"][index].tolist()]
-                centre_x = 0.5 * (box[0] + box[2])
-                sector = min(11, max(0, int(centre_x / image.width * 12)))
-                if requested_sectors and sector not in requested_sectors:
-                    continue
                 detection = {
                     "query": query,
                     "request_index": request_index,
                     "purpose": str(request.get("purpose", ""))[:240],
                     "score": round(float(result["scores"][index]), 5),
                     "box": box,
-                    "sector": f"S{sector}",
+                    "bbox_norm": [round(box[0] / image.width * 1000.0, 1),
+                                  round(box[1] / image.height * 1000.0, 1),
+                                  round(box[2] / image.width * 1000.0, 1),
+                                  round(box[3] / image.height * 1000.0, 1)],
                     "width_px": round(box[2] - box[0], 1),
                     "height_px": round(box[3] - box[1], 1),
                 }
@@ -134,7 +119,7 @@ class SAMAssistant:
                 clusters.append({
                     "id": f"C{len(clusters)}",
                     "box": detection["box"],
-                    "sector": detection["sector"],
+                    "bbox_norm": detection["bbox_norm"],
                     "max_score": detection["score"],
                     "queries": [detection["query"]],
                     "purposes": [detection["purpose"]] if detection["purpose"] else [],
@@ -178,7 +163,7 @@ class SAMAssistant:
             crop_draw.rectangle(crop_box, outline=(*color, 255), width=6)
             crop_draw.rectangle((0, 0, 300, 28), fill=(0, 0, 0, 205))
             crop_draw.text((6, 6),
-                           f"{cluster['id']} {cluster['sector']} SAM proposal",
+                           f"{cluster['id']} SAM proposal",
                            fill=(*color, 255))
             crop_path = output_dir / f"{tag}_{cluster['id']}_crop.png"
             crop.save(crop_path)
@@ -191,8 +176,7 @@ class SAMAssistant:
             color = palette[rank % len(palette)] + (255,)
             x0, y0, x1, y1 = cluster["box"]
             draw.rectangle((x0, y0, x1, y1), outline=color, width=4)
-            label = (f"{cluster['id']} {cluster['sector']} "
-                     f"{cluster['max_score']:.2f}")
+            label = f"{cluster['id']} {cluster['max_score']:.2f}"
             label_y = max(0, y0 - 18)
             draw.rectangle((x0, label_y, x0 + 110, label_y + 18),
                            fill=(0, 0, 0, 205))

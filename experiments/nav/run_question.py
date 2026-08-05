@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Closed-loop answer to a numerical challenge question, sensors only.
 
-    survey -> triage -> (zoom-arbitrate | approach) -> re-survey -> answer
+    survey -> temporary tally -> explore -> re-survey -> final answer
 
 Runs on the HOST (SAM3 + Qwen3-VL need the GPU here) and shells into
 iros2026_system for anything ROS-side (capture, drive, publish).
@@ -16,11 +16,10 @@ Role split, as validated:
 
 usage:
   run_question.py "<question>" [--budget 600]
-  run_question.py --story "<question>" [--budget 600] [--max-moves 2]
-
-The --story route is the Qwen-led narrative active-perception loop in
-run_story_explorer.py. Qwen may call SAM as a subordinate localization tool;
-SAM never decides identity, count, movement, or completion.
+Intermediate counts are deliberately provisional.  The single Qwen decision
+maker cannot finalize while a safe reference, hidden-region, or frontier
+viewpoint remains.  SAM proposes candidates; it is not a second reasoning
+agent.
 """
 import argparse
 import json
@@ -43,11 +42,14 @@ from coverage import Coverage
 C = "iros2026_system"
 STACK = "/home/docker/autonomy_stack_mecanum_wheel_platform"
 SRC = "/opt/ros/jazzy/setup.bash"
+ROS_DOMAIN_ID = os.environ.get(
+    "QUESTION_ROS_DOMAIN_ID", os.environ.get("ROS_DOMAIN_ID", "77"))
 MIN_PX = 60.0
 MAX_APPROACH = 2      # give up closing on a target after this many tries
 ZOOM = 6
 COARSE_THR = 0.30
 W_IMG, H_IMG = 1920, 640
+DRIVE_ENABLED = True
 
 
 def run_zoom_audit(question, image_path, box_text, output_dir):
@@ -121,7 +123,9 @@ Finish with exactly one JSON object:
 
 
 def sh(cmd, timeout=300):
-    r = subprocess.run(["docker", "exec", C, "bash", "-lc", cmd],
+    r = subprocess.run(["docker", "exec", "-e",
+                        f"ROS_DOMAIN_ID={ROS_DOMAIN_ID}",
+                        C, "bash", "-lc", cmd],
                        capture_output=True, text=True, timeout=timeout)
     return r.stdout + r.stderr
 
@@ -216,6 +220,9 @@ def capture(tag, secs=5.0):
 
 
 def drive_to(x, y, timeout_s=60):
+    if not DRIVE_ENABLED:
+        return "disabled", (f"NO_DRIVE: would have moved to "
+                            f"({x:.3f}, {y:.3f})")
     out = sh_ros(f"python3 /tmp/far_bridge.py {x:.3f} {y:.3f} {timeout_s}",
                  timeout_s + 60)
     status = "unknown"
@@ -580,15 +587,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("question")
     ap.add_argument("--budget", type=float, default=600.0)
-    ap.add_argument("--max-iters", type=int, default=4)
+    ap.add_argument("--max-iters", type=int, default=12)
     ap.add_argument("--story", action="store_true",
-                    help="use the Qwen-led narrative exploration loop")
+                    help="deprecated compatibility flag; uses the restored single-agent loop")
     ap.add_argument("--story-output", default="story_run",
-                    help="artifact directory for --story mode")
+                    help="artifact directory used by --live")
     ap.add_argument("--max-moves", type=int, default=2,
-                    help="maximum robot moves in --story mode")
+                    help="deprecated compatibility option; ignored")
     ap.add_argument("--no-drive", action="store_true",
-                    help="capture/reason but do not move in --story mode")
+                    help="single capture and reasoning pass without robot motion")
+    ap.add_argument("--live", action="store_true",
+                    help="stream the single Qwen controller to the live dashboard")
+    ap.add_argument("--dashboard-port", type=int, default=8765,
+                    help="localhost port for --live")
     ap.add_argument("--zoom-audit-image",
                     help="existing panorama to re-audit without ROS capture")
     ap.add_argument("--zoom-box", default="",
@@ -597,6 +608,11 @@ def main():
                     help="artifact directory for the targeted zoom audit")
     a = ap.parse_args()
 
+    global DRIVE_ENABLED
+    DRIVE_ENABLED = not a.no_drive
+    if a.no_drive:
+        a.max_iters = 1
+
     if a.zoom_audit_image:
         if not a.zoom_box:
             ap.error("--zoom-box is required with --zoom-audit-image")
@@ -604,17 +620,27 @@ def main():
             a.question, a.zoom_audit_image, a.zoom_box, a.zoom_output)
 
     if a.story:
-        story_runner = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "run_story_explorer.py")
-        command = [
-            sys.executable, story_runner, a.question,
-            "--output", a.story_output,
-            "--budget", str(a.budget),
-            "--max-moves", str(a.max_moves),
-        ]
-        if a.no_drive:
-            command.append("--no-drive")
-        return subprocess.call(command)
+        print("[mode] --story now uses the restored single-Qwen exploration loop; "
+              "the observer/auditor/fusion chain is disabled", flush=True)
+
+    live = None
+    run_dir = Path(a.story_output).resolve()
+    if a.live:
+        from live_trace import LiveTrace, launch_dashboard
+        live = LiveTrace(run_dir)
+        _, dashboard_url = launch_dashboard(run_dir, a.dashboard_port)
+        live.emit("run_start", question=a.question,
+                  mode="single_qwen_coverage_exploration",
+                  budget_s=a.budget, max_iterations=a.max_iters,
+                  dashboard_url=dashboard_url)
+        print(f"[dashboard] {dashboard_url}", flush=True)
+
+    def emit(kind, **payload):
+        if live is not None:
+            live.emit(kind, payload)
+
+    progress_path = ((run_dir / "q_progress.json") if live is not None
+                     else Path("q_progress.json"))
 
     t_start = time.time()
     left = lambda: a.budget - (time.time() - t_start)
@@ -628,13 +654,18 @@ def main():
     from agent import VLMAgent
     print("[load] Qwen3-VL-8B (4-bit) ...", flush=True)
     vlm = VLMAgent(load_4bit=True)
-    vlm.trace_dir = "trace_imgs"
-    subprocess.run(["rm","-rf","trace_imgs"], check=False)
+    vlm.trace_dir = str(run_dir / "model_images") if live else "trace_imgs"
+    if live is not None:
+        vlm.event_callback = live.emit
+    else:
+        subprocess.run(["rm", "-rf", "trace_imgs"], check=False)
     print("[load] done.  (tracing every VLM call -> trace_imgs/ + vlm_trace.json)\n", flush=True)
 
     # ---- parse the question (semantic job -> VLM) -------------------------
     img, cloud, pose, terrain = capture("q_snap0")
     pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    emit("capture_complete", iteration=0, pose=pose.tolist(),
+         image=str(Path("q_snap0/frame.png").resolve()))
     parsed = parse_question(vlm, pil, a.question)
     concept = parsed["target_concept"]
     strict = parsed["strict_description"]
@@ -647,6 +678,9 @@ def main():
     state._tried_vps = set()      # viewpoints already attempted (livelock guard)
     refs, ref_done = [], set()    # reference objects named in the question
     history = []
+    temporary_counts = []
+    exploration_complete = False
+    finished_reason = "iteration limit reached before coverage was exhausted"
 
     cov = Coverage(pose[:2])
 
@@ -661,6 +695,8 @@ def main():
         if it > 1:
             img, cloud, pose, terrain = capture(f"q_snap{it-1}")
             pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            emit("capture_complete", iteration=it - 1, pose=pose.tolist(),
+                 image=str(Path(f"q_snap{it-1}/frame.png").resolve()))
         robot_xy = pose[:2]
         if it > 1:
             accum.add(cloud, terrain)
@@ -774,6 +810,25 @@ def main():
 
         print(f"[state]\n{state.table(robot_xy)}")
 
+        # A tally at one viewpoint is evidence accumulated so far, never a room
+        # total. Persist every snapshot so later reasoning can retain instances
+        # found at earlier poses without turning the first count into an answer.
+        temporary = {
+            "iteration": it,
+            "pose_xy": [round(float(robot_xy[0]), 3),
+                        round(float(robot_xy[1]), 3)],
+            "temporary_count": int(state.count()),
+            "confirmed_ids": [int(h.id) for h in state.confirmed()],
+            "coverage": cov.stats(),
+            "final": False,
+        }
+        temporary_counts.append(temporary)
+        progress_path.write_text(
+            json.dumps({"temporary_counts": temporary_counts}, indent=2) + "\n")
+        emit("temporary_count", **temporary)
+        print(f"[temporary count] {temporary['temporary_count']} -- provisional; "
+              "continue until coverage/viewpoint candidates are exhausted")
+
         # ---- decide: approach or answer ---------------------------------
         need = state.needs_approach(robot_xy, MIN_PX)
         if not need:
@@ -785,7 +840,7 @@ def main():
             if cands and left() > 120:
                 d, raw = vlm.reason_next_action(
                     pil, a.question, state.table(robot_xy), cov.stats(),
-                    left(), cands, history)
+                    left(), cands, history, temporary_count=state.count())
                 if d:
                     print(f"[think] observations : {d.get('observations')}")
                     print(f"[think] might miss   : {d.get('might_be_missing')}")
@@ -809,19 +864,42 @@ def main():
                         history.append(f"reasoned trip to {ch['xy']}: {ch['why'][:60]} -> {st}")
                         continue
                     if d.get("action") == "answer":
-                        # honour the decision -- otherwise we fall through to
-                        # frontier exploration and override the model's own call
-                        print(f"[think] model says done (its count={d.get('count')}; "
-                              f"we report our own verified count)")
-                        print(f"\n[done] planner chose to answer after {it} iter")
-                        break
-                else:
-                    print(f"[think] unparseable, falling back to frontier: {raw[:120]}")
-                    vp, gain = cov.next_viewpoint(robot_xy)
-                    if vp is not None:
-                        st, _ = drive_to(vp[0], vp[1], 60)
-                        history.append(f"frontier fallback -> {st}")
+                        # An early answer is only a hypothesis. Candidate viewpoints
+                        # prove the room search is incomplete, so keep the count and
+                        # take the highest-priority remaining observation instead.
+                        early = d.get("count", d.get("temporary_count", state.count()))
+                        print(f"[think] early count {early} saved as TEMPORARY; "
+                              "candidate viewpoints remain")
+                        history.append(
+                            f"temporary count {early} at iteration {it}; not final "
+                            "because unexplored viewpoints remained")
+                        ch = cands[0]
+                        print(f"[think] continuing with [0] {ch['why']}")
+                        st, _ = drive_to(ch["xy"][0], ch["xy"][1], 60)
+                        print(f"[think] -> {st}")
+                        state._tried_vps.add(
+                            tuple(round(v, 2) for v in ch["xy"]))
+                        if ch.get("ref_idx") is not None:
+                            ref_done.add(ch["ref_idx"])
+                        history.append(
+                            f"continued after temporary count to {ch['xy']}: "
+                            f"{ch['why'][:60]} -> {st}")
                         continue
+                # A malformed response or an invalid action cannot turn a
+                # provisional tally into a final one. Candidate order already
+                # prioritizes unscanned references, hidden-near-found regions,
+                # then the coverage frontier, so take the first safe option.
+                print(f"[think] unusable movement choice; continuing with the "
+                      f"highest-priority candidate. Raw: {raw[:120]}")
+                ch = cands[0]
+                st, _ = drive_to(ch["xy"][0], ch["xy"][1], 60)
+                print(f"[think fallback] [0] {ch['why']} -> {st}")
+                state._tried_vps.add(tuple(round(v, 2) for v in ch["xy"]))
+                if ch.get("ref_idx") is not None:
+                    ref_done.add(ch["ref_idx"])
+                history.append(
+                    f"fallback continued to {ch['xy']}: {ch['why'][:60]} -> {st}")
+                continue
             # Everything VISIBLE is resolved -- but unseen floor may hold more
             # instances. This is the step whose absence made us answer 2 of 4.
             if left() > 120:
@@ -836,9 +914,17 @@ def main():
                         cov.block[cov._ij(vp)[0][0], cov._ij(vp)[0][1]] = True
                     continue
                 print(f"[explore] no viewpoint with worthwhile gain ({gain} cells)")
-            print(f"\n[done] visible resolved and coverage exhausted after {it} iter")
+            if not cands and left() > 120:
+                exploration_complete = True
+                finished_reason = "coverage and answer-relevant viewpoints exhausted"
+                print(f"\n[done] visible resolved and coverage exhausted after {it} iter")
+            else:
+                finished_reason = "time budget reserved for final verification"
+                print(f"\n[budget] stopping exploration with provisional evidence "
+                      f"and {left():.0f}s left")
             break
         if left() < 90:
+            finished_reason = "time budget required a best-evidence answer"
             print("\n[budget] too little time to approach; answering now")
             break
         h, cur_r, want_r = need[0]
@@ -862,7 +948,10 @@ def main():
         if round_i == 1:
             print("\n=== HANDED BACK TO THE MODEL ===")
             print(transcript)
-        d, raw = vlm.final_count(pil, a.question, transcript)
+        d, raw = vlm.final_count(
+            pil, a.question, transcript,
+            exploration_complete=exploration_complete,
+            finish_reason=finished_reason)
         if not (d and isinstance(d.get("count"), int)):
             print(f"\n[count] reply unusable, using verified tally: {raw[:200]}")
             break
@@ -895,10 +984,21 @@ def main():
                                     big_cloud, robot_xy, f"q_recheck{k}")
         img, cloud, pose, terrain = capture("q_final", 3.0)
         pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    if temporary_counts:
+        progress_path.write_text(json.dumps({
+            "temporary_counts": temporary_counts,
+            "final_count": int(count),
+            "exploration_complete": exploration_complete,
+            "finished_because": finished_reason,
+        }, indent=2) + "\n")
+    emit("run_complete", final_count=int(count),
+         exploration_complete=exploration_complete,
+         finished_because=finished_reason)
     print(f"\n=== ANSWER: {count}")
     print(publish_answer(count).strip())
     state.save("q_state.json", "q_points.npz")
-    vlm.dump_trace("vlm_trace.json")
+    vlm.dump_trace(str(run_dir / "vlm_trace.json") if live else
+                   "vlm_trace.json")
     print(f"elapsed {time.time()-t_start:.0f}s   state -> q_state.json")
 
 

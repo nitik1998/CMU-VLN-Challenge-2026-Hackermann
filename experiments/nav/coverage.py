@@ -20,12 +20,19 @@ the FRONTIER: known-free cells that touch unknown space.
 Inputs are all challenge-allowed: /terrain_map_ext, /registered_scan,
 /state_estimation. The grid is a fixed generous extent so it never needs resizing.
 """
+import cv2
 import numpy as np
 
 RES = 0.20
 OBST_H = 0.20
 OBS_R = 5.0                 # range at which we still trust detection
-ROBOT_R = 0.40
+# The configured platform footprint is 0.50 x 0.50 m. Its circumscribed
+# radius is 0.354 m; live hotel-room runs still stalled at endpoints accepted
+# with the old 0.40 m radius because that left only ~4.6 cm for sparse-map and
+# controller clearance error. Use the already field-tested 0.55 m endpoint
+# clearance from run_sweep.py. This changes where we ask the planner to stop,
+# not the planner's collision model or the 0.15 m goal tolerance.
+ROBOT_R = 0.55
 OCC_Z = (0.15, 1.60)        # cloud heights that block a view of the floor
 HALF_EXTENT = 12.0          # metres each way from the origin pose
 
@@ -38,6 +45,10 @@ class Coverage:
         self.free = np.zeros(self.shape, bool)
         self.block = np.zeros(self.shape, bool)
         self.observed = np.zeros(self.shape, bool)
+        # Minimum robot-to-cell range at which each free cell has actually
+        # been observed.  Boolean ``observed`` is retained for diagnostics;
+        # this array is what makes coverage meaningful for the queried class.
+        self.min_observation_range = np.full(self.shape, np.inf, np.float32)
 
     # ---- grid utils --------------------------------------------------
     def _ij(self, xy):
@@ -126,7 +137,124 @@ class Coverage:
         seen = tg[vis]
         newly = int((~self.observed[seen[:, 0], seen[:, 1]]).sum())
         self.observed[seen[:, 0], seen[:, 1]] = True
+        ranges = np.linalg.norm((seen - cell) * RES, axis=1)
+        old = self.min_observation_range[seen[:, 0], seen[:, 1]]
+        self.min_observation_range[seen[:, 0], seen[:, 1]] = np.minimum(
+            old, ranges).astype(np.float32)
         return newly
+
+    def enumerated_for(self, max_range_m):
+        """Known free cells inspected closely enough for the target class."""
+        return self.free & (self.min_observation_range <= float(max_range_m))
+
+    @staticmethod
+    def _component_fit_diameter(mask):
+        """Approximate the largest disc diameter that fits in a cell mask."""
+        if not mask.any():
+            return 0.0
+        padded = np.pad(np.asarray(mask, bool), 1, constant_values=False)
+        distances = cv2.distanceTransform(
+            padded.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        radius_cells = float(distances.max())
+        # EDT measures centre-to-outside-centre. Remove half a cell on either
+        # side so a one-cell sliver measures RES, not 2*RES.
+        return max(0.0, (2.0 * radius_cells - 1.0) * RES)
+
+    def residual_components(self, max_range_m, min_size_m,
+                            retired_cells=(), max_n=12, robot_xy=None,
+                            excluded_xy=()):
+        """Fit-capable reachable-adjacent space not enumerated for a class.
+
+        A residual region is identified and discharged by its cell set, never
+        its centroid. Room-sized components are emitted as local inspectable
+        cell sets so one attempted viewpoint cannot retire a whole room.
+        Unknown space is admitted only in a bounded band connected to mapped
+        free floor.  This exposes doorways/new rooms without treating the
+        entire fixed grid outside the building as reachable floor.
+        """
+        enumerated = self.enumerated_for(max_range_m)
+        unknown = self._unknown()
+        kernel = np.ones((3, 3), np.uint8)
+        frontier_unknown = unknown & (cv2.dilate(
+            self.free.astype(np.uint8), kernel) > 0)
+        unknown_band = frontier_unknown.copy()
+        # Go deeply enough through a doorway for the target to pass the fit
+        # test. Later captures grow the map and expose subsequent bands.
+        depth = max(2, int(np.ceil(float(min_size_m) / RES)) + 1)
+        for _ in range(depth - 1):
+            unknown_band |= unknown & (cv2.dilate(
+                unknown_band.astype(np.uint8), kernel) > 0)
+        residual = (self.free & ~enumerated) | unknown_band
+        retired = {tuple(map(int, cell)) for cell in retired_cells}
+        if retired:
+            valid_retired = np.asarray([
+                cell for cell in retired
+                if 0 <= cell[0] < self.shape[0] and
+                0 <= cell[1] < self.shape[1]], int)
+            if len(valid_retired):
+                residual[valid_retired[:, 0], valid_retired[:, 1]] = False
+
+        count, labels = cv2.connectedComponents(
+            residual.astype(np.uint8), connectivity=4)
+        reachable = self.reachable_safe_mask(robot_xy)
+        components = []
+        for label in range(1, count):
+            cells = np.argwhere(labels == label)
+            if not len(cells):
+                continue
+            cell_set = {tuple(map(int, cell)) for cell in cells}
+            lo, hi = cells.min(axis=0), cells.max(axis=0) + 1
+            local = labels[lo[0]:hi[0], lo[1]:hi[1]] == label
+            fit_diameter = self._component_fit_diameter(local)
+            if fit_diameter + 1e-6 < float(min_size_m):
+                continue
+            distances = cv2.distanceTransform(
+                local.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+            centre_local = np.asarray(np.unravel_index(
+                int(np.argmax(distances)), distances.shape))
+            target = lo + centre_local
+            viewpoint = self._viewpoint_seeing(
+                target, reachable=reachable, excluded_xy=excluded_xy)
+            viewpoint_kind = "line_of_sight"
+            if viewpoint is None:
+                # Drive toward a safe near-frontier pose to grow the map. Do
+                # not declare space unobservable merely because the current
+                # partial map has no direct line of sight.
+                viewpoint = self._viewpoint_near(
+                    target, reachable=reachable, excluded_xy=excluded_xy)
+                viewpoint_kind = "map_expansion"
+            state = "active" if viewpoint is not None else "blocked"
+            visit_cells = cells
+            if viewpoint is not None:
+                # A single drive can discharge only the local portion this
+                # capture is meant to inspect, never an entire room-sized
+                # connected component.
+                inspection_radius = max(
+                    0.65, min(1.50, float(max_range_m) / 2.0))
+                local_distance = np.linalg.norm(
+                    (cells - target) * RES, axis=1)
+                local_cells = cells[local_distance <= inspection_radius]
+                if len(local_cells):
+                    visible = self._los(viewpoint, local_cells)
+                    if visible.any():
+                        visit_cells = local_cells[visible]
+            visit_set = {tuple(map(int, cell)) for cell in visit_cells}
+            components.append({
+                "state": state,
+                "xy": None if viewpoint is None else tuple(self._xy(viewpoint)),
+                "viewpoint_kind": viewpoint_kind,
+                "target_xy": tuple(self._xy(target)),
+                "cells": sorted(visit_set),
+                "cell_count": int(len(visit_set)),
+                "source_component_cells": int(len(cell_set)),
+                "source_cells": sorted(cell_set),
+                "area_m2": round(len(visit_set) * RES * RES, 2),
+                "fit_diameter_m": round(fit_diameter, 2),
+            })
+        components.sort(key=lambda value: (
+            value["state"] != "active", -value["fit_diameter_m"],
+            -value["cell_count"]))
+        return components[:max_n]
 
     # ---- frontier ----------------------------------------------------
     def _unknown(self):
@@ -143,23 +271,90 @@ class Coverage:
         return np.argwhere(touching_unknown | unobserved_free)
 
     def _safe(self, cell):
+        """A robot endpoint needs a fully known-free footprint.
+
+        Treating UNKNOWN as safe placed the vehicle centre on a frontier with
+        16/25 footprint cells unsensed. The controller then correctly stopped
+        20 cm short when those cells resolved into collision geometry.
+        """
         r = int(np.ceil(ROBOT_R / RES))
         i0, i1 = max(0, cell[0] - r), min(self.shape[0], cell[0] + r + 1)
         j0, j1 = max(0, cell[1] - r), min(self.shape[1], cell[1] + r + 1)
-        return not self.block[i0:i1, j0:j1].any()
+        rows, cols = np.ogrid[i0:i1, j0:j1]
+        footprint = ((rows - cell[0]) ** 2 + (cols - cell[1]) ** 2 <= r ** 2)
+        known_free = self.free[i0:i1, j0:j1]
+        blocked = self.block[i0:i1, j0:j1]
+        return bool(known_free[footprint].all() and
+                    not blocked[footprint].any())
+
+    def is_safe_xy(self, xy):
+        cell = self._ij(xy)[0]
+        return bool(self._in(cell[None])[0] and self._safe(cell))
+
+    def reachable_safe_mask(self, robot_xy):
+        """Known-safe endpoint component connected to the current robot pose.
+
+        Returns ``None`` when the partial terrain map cannot establish a start
+        component; callers then remain conservative and do not prune.
+        """
+        if robot_xy is None:
+            return None
+        radius = int(np.ceil(ROBOT_R / RES))
+        size = 2 * radius + 1
+        rows, cols = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+        kernel = ((rows ** 2 + cols ** 2) <= radius ** 2).astype(np.uint8)
+        safe = cv2.erode(self.free.astype(np.uint8), kernel,
+                         borderType=cv2.BORDER_CONSTANT,
+                         borderValue=0).astype(bool)
+        start = self._ij(robot_xy)[0]
+        if not self._in(start[None])[0]:
+            return None
+        if not safe[tuple(start)]:
+            candidates = np.argwhere(safe)
+            if not len(candidates):
+                return None
+            distances = np.linalg.norm((candidates - start) * RES, axis=1)
+            nearest = int(np.argmin(distances))
+            if distances[nearest] > 0.80:
+                return None
+            start = candidates[nearest]
+        count, labels = cv2.connectedComponents(
+            safe.astype(np.uint8), connectivity=4)
+        if count <= 1:
+            return None
+        label = int(labels[tuple(start)])
+        return labels == label if label else None
+
+    def is_reachable_xy(self, robot_xy, goal_xy) -> bool:
+        reachable = self.reachable_safe_mask(robot_xy)
+        if reachable is None:
+            return self.is_safe_xy(goal_xy)
+        cell = self._ij(goal_xy)[0]
+        return bool(self._in(cell[None])[0] and reachable[tuple(cell)])
 
     def next_viewpoint(self, robot_xy, min_gain=8, max_candidates=45,
-                       min_travel=0.7):
+                       min_travel=0.7, excluded_xy=None):
         """Reachable free cell revealing the most unobserved floor / unknown space.
         Returns (xy, gain) or (None, 0) when nothing worthwhile is left."""
         fr = self.frontier_cells()
         if not len(fr):
             return None, 0
         rc = self._ij(robot_xy)[0]
+        reachable = self.reachable_safe_mask(robot_xy)
         # candidates = safe free cells, preferring ones near the frontier mass
         cands = np.argwhere(self.free)
+        if reachable is not None:
+            cands = np.argwhere(reachable)
         if not len(cands):
             return None, 0
+        if excluded_xy:
+            excluded_cells = [self._ij(value)[0] for value in excluded_xy]
+            keep = np.ones(len(cands), bool)
+            for excluded in excluded_cells:
+                keep &= np.linalg.norm((cands - excluded) * RES, axis=1) >= 0.55
+            cands = cands[keep]
+            if not len(cands):
+                return None, 0
         fc = fr.mean(axis=0)
         cands = cands[np.argsort(np.linalg.norm(cands - fc, axis=1))]
         cands = cands[: max_candidates * 4]
@@ -230,7 +425,8 @@ class Coverage:
                 break
         return out
 
-    def _viewpoint_seeing(self, target_cell, max_r=4.0):
+    def _viewpoint_seeing(self, target_cell, max_r=4.0, reachable=None,
+                          excluded_xy=()):
         """Nearest safe free cell with line of sight to target_cell."""
         r = int(max_r / RES)
         i0, i1 = max(0, target_cell[0] - r), min(self.shape[0], target_cell[0] + r + 1)
@@ -243,8 +439,35 @@ class Coverage:
             c = sub[k]
             if d[k] < 0.6 or not self._safe(c):
                 continue
+            if reachable is not None and not reachable[tuple(c)]:
+                continue
+            goal = self._xy(c)
+            if any(np.linalg.norm(goal - np.asarray(old, float)) < 0.55
+                   for old in excluded_xy):
+                continue
             if self._los(c, np.array([target_cell]))[0]:
                 return c
+        return None
+
+    def _viewpoint_near(self, target_cell, max_r=8.0, reachable=None,
+                        excluded_xy=()):
+        """Nearest safe mapped pose for expanding toward an occluded target."""
+        r = int(max_r / RES)
+        i0, i1 = max(0, target_cell[0] - r), min(self.shape[0], target_cell[0] + r + 1)
+        j0, j1 = max(0, target_cell[1] - r), min(self.shape[1], target_cell[1] + r + 1)
+        sub = np.argwhere(self.free[i0:i1, j0:j1]) + (i0, j0)
+        if not len(sub):
+            return None
+        distances = np.linalg.norm((sub - target_cell) * RES, axis=1)
+        for index in np.argsort(distances):
+            candidate = sub[index]
+            goal = self._xy(candidate)
+            if any(np.linalg.norm(goal - np.asarray(old, float)) < 0.55
+                   for old in excluded_xy):
+                continue
+            if (distances[index] >= 0.60 and self._safe(candidate) and
+                    (reachable is None or reachable[tuple(candidate)])):
+                return candidate
         return None
 
     def stats(self):

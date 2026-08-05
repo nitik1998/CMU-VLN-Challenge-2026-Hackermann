@@ -9,7 +9,7 @@ Allowed at test time:
 Writes: frame.png, cloud_map.npy (Nx3, map frame), pose.npz
 Run INSIDE iros2026_system.
 
-usage: capture.py <outdir> [accumulate_seconds]
+usage: capture.py <outdir> [accumulate_seconds] [voxel_m]
 """
 import sys, os, time
 import numpy as np
@@ -22,6 +22,9 @@ import cv_bridge, cv2
 
 outdir = sys.argv[1]
 accum_secs = float(sys.argv[2]) if len(sys.argv) > 2 else 4.0
+# 5 cm is fine for navigation/coverage but coarse for the small objects the
+# challenge scores, and for reconstruction. Callers may ask for finer.
+voxel_m = float(sys.argv[3]) if len(sys.argv) > 3 else 0.05
 os.makedirs(outdir, exist_ok=True)
 
 rclpy.init()
@@ -77,8 +80,8 @@ if state["img"] is None or not state["clouds"]:
 img, pose = state["img"]
 cloud = np.concatenate(state["clouds"], axis=0)
 
-# voxel downsample (5cm) to keep it manageable
-key = np.floor(cloud / 0.05).astype(np.int64)
+# voxel downsample to keep it manageable
+key = np.floor(cloud / voxel_m).astype(np.int64)
 _, idx = np.unique(key, axis=0, return_index=True)
 cloud = cloud[idx]
 
@@ -97,7 +100,7 @@ else:
     print("terrain    : NONE received")
 
 print(f"image      : {img.shape}")
-print(f"cloud      : {cloud.shape} (map frame, 5cm voxels)")
+print(f"cloud      : {cloud.shape} (map frame, {voxel_m*100:.0f}cm voxels)")
 print(f"sensor pos : {pose[:3]}")
 print(f"sensor quat: {pose[3:]}")
 print(f"saved -> {outdir}")

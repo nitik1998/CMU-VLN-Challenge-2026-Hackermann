@@ -6,6 +6,11 @@
 __pycache__/
 *.py[cod]
 
+# Secrets -- never commit API keys
+.env
+*.env
+experiments/.env
+
 # Local ROS/process diagnostics and generated perception artifacts
 diagnostics/
 scene_analysis/**

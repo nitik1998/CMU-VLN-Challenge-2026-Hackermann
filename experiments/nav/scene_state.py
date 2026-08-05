@@ -25,6 +25,8 @@ SAME_OVERLAP = 0.30     # |A n B| / min(|A|,|B|) above this -> same object
 GROUP_CONTAIN = 0.60    # A covers this much of B ...
 GROUP_RATIO = 1.7       # ... and is this many times bigger -> A is a group of Bs
 MERGE_R = 0.40          # fallback only, when a detection has no points at all
+FLOOR_MERGE_XY_R = 0.45 # floor-ray estimates drift across views; compare in XY
+FLOOR_MAX_Z = 0.25      # restrict that fallback to floor-level detections
 IMG_W = 1920
 HFOV_DEG = 360.0
 
@@ -183,6 +185,29 @@ class SceneState:
                 if from_xy is not None:
                     h.seen_from.append(tuple(np.round(from_xy, 2)))
                 return h
+            # A floor object is often first ranged by ground-plane intersection
+            # because the Livox has no points at that elevation. A closer view can
+            # later select real points. Do not create a new identity merely because
+            # one sighting has a voxel fingerprint and the earlier one does not.
+            floor_match = next((
+                h for h in self.hyps
+                if max(float(h.pos[2]), float(pos[2])) <= FLOOR_MAX_Z
+                and np.linalg.norm(h.pos[:2] - pos[:2]) <= FLOOR_MERGE_XY_R
+                and max(h.size_m, size_m) / max(0.05, min(h.size_m, size_m)) <= 2.5
+            ), None)
+            if floor_match is not None:
+                h = floor_match
+                if px_width > h.best_px:
+                    h.size_m = max(h.size_m, size_m)
+                    h.best_px = px_width
+                h.coarse = max(h.coarse, coarse)
+                h.add_points(new_pts)
+                # Keep a running centre rather than snapping to whichever small
+                # surface patch the sparse scan happened to hit.
+                h.pos = 0.5 * (h.pos + pos)
+                if from_xy is not None:
+                    h.seen_from.append(tuple(np.round(from_xy, 2)))
+                return h
             h = Hypothesis(self._next, pos, size_m, coarse)
             h.best_px = px_width
             h.add_points(new_pts)
@@ -250,13 +275,19 @@ class SceneState:
             changed = False
             for i, a in enumerate(self.hyps):
                 for b in self.hyps[i + 1:]:
-                    if not a.vox or not b.vox:
+                    voxel_same = bool(
+                        a.vox and b.vox and overlap(a.vox, b.vox) >= min_overlap)
+                    if voxel_same:
+                        ea, eb = _extent(a.pts), _extent(b.pts)
+                        if max(ea, eb) / max(1e-6, min(ea, eb)) > extent_ratio:
+                            voxel_same = False     # one contains the other -> group
+                    floor_same = bool(
+                        max(float(a.pos[2]), float(b.pos[2])) <= FLOOR_MAX_Z
+                        and np.linalg.norm(a.pos[:2] - b.pos[:2]) <= FLOOR_MERGE_XY_R
+                        and max(a.size_m, b.size_m) /
+                        max(0.05, min(a.size_m, b.size_m)) <= 2.5)
+                    if not (voxel_same or floor_same):
                         continue
-                    if overlap(a.vox, b.vox) < min_overlap:
-                        continue
-                    ea, eb = _extent(a.pts), _extent(b.pts)
-                    if max(ea, eb) / max(1e-6, min(ea, eb)) > extent_ratio:
-                        continue          # one contains the other -> a group
                     keep, drop = (a, b) if len(a.pts) >= len(b.pts) else (b, a)
                     keep.add_points(drop.pts)
                     keep.pos = keep.pts.mean(axis=0)

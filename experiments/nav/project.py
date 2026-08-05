@@ -21,12 +21,12 @@ def quat_to_R(x, y, z, w):
         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
 
 
-def map_to_camera(pts_map, pose):
+def map_to_camera(pts_map, pose, r_sc=R_SC, t_sc=T_SC):
     """pose = [px,py,pz,qx,qy,qz,qw] of sensor in map."""
     t = pose[:3]
     R_ms = quat_to_R(*pose[3:])
     p_sensor = (pts_map - t) @ R_ms            # R_ms^T @ v  == v @ R_ms
-    p_cam = (p_sensor - T_SC) @ R_SC           # R_SC^T @ v
+    p_cam = (p_sensor - t_sc) @ r_sc           # R_sc^T @ v
     return p_cam
 
 

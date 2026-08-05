@@ -27,10 +27,32 @@ source install/setup.bash
 # 0.8 m standoff produced actual distances of 1.5-2.4 m, at which a 0.18 m object
 # is 15-29 px and you cannot tell whether it sits on a table or a cabinet. Shrink
 # it (and converge_distance) so the robot really does drive up to things.
+# graph/connect_votes_size and graph/node_finalize_thred gate when a locally
+# seen vertex gets promoted into the GLOBAL graph -- it needs that many
+# repeated "votes" (separate observations) first. Verified live: the global
+# vertex count froze completely (27, 0 new added) while the robot itself was
+# stuck, which is a real deadlock -- a stationary robot can only re-observe
+# the same local vertices from the same spot, so it can never accumulate
+# enough votes to unlock the very graph growth it needs to move again.
+# local_planner_range widened too: 2.5m was often shorter than the nearest
+# open lane past nearby furniture in this room.
+# robot_dim gates corridor width when the corner-detector BUILDS the graph in
+# the first place -- unlike the vote-threshold params above (which only
+# affect trusting a vertex that already exists), a gap narrower than
+# robot_dim may never generate a graph edge at all, which matches the "0
+# new vertices, 0ms path search" signature much better than a starved-vote
+# theory did (tested, no effect). True robot footprint is 0.5m
+# (local_planner.launch vehicleLength/vehicleWidth); 0.8 was stock. 0.6
+# keeps a real 20% margin while allowing gaps the 0.5m robot (and a human
+# driving it manually) already proved passable.
 exec ros2 run far_planner far_planner --ros-args \
   --params-file "install/far_planner/share/far_planner/config/${CFG}.yaml" \
   -p g_planner/goal_adjust_radius:=0.25 \
   -p g_planner/converge_distance:=0.20 \
+  -p graph/connect_votes_size:=3 \
+  -p graph/node_finalize_thred:=2 \
+  -p local_planner_range:=5.0 \
+  -p robot_dim:=0.6 \
   -r /odom_world:=/state_estimation \
   -r /terrain_cloud:=/terrain_map_ext \
   -r /scan_cloud:=/terrain_map \

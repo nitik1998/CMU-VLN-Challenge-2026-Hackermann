@@ -8,8 +8,8 @@ answer on overlap with that box. Matching the object's true silhouette would sco
 WORSE, because IoU is computed box-to-box. The box centre doubles as the navigation
 waypoint (README L53).
 
-Optionally also publishes the mask-selected member points as a SPHERE_LIST in a
-separate namespace. Those are diagnostic only, never the answer -- they reveal
+Optionally also publishes the mask-selected member points as a SPHERE_LIST on a
+separate debug TOPIC. Those are diagnostic only, never the answer -- they reveal
 whether the points really lie on the object or have bled onto the wall behind it,
 which is what inflated one scroll's width to 0.25 m against a true 0.04 m.
 
@@ -22,6 +22,7 @@ usage: marker_pub.py '<json>' [points.npy]
 """
 import json
 import math
+import os
 import sys
 
 import rclpy
@@ -29,16 +30,24 @@ from rclpy.node import Node
 from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker
 
-raw = json.loads(sys.argv[1])
-# accept a single box or a list. For object-reference questions the answer is ONE
-# box (the referred object is unique); a list is for inspecting a whole count.
-specs = raw if isinstance(raw, list) else [raw]
+raw = (json.load(open(sys.argv[1])) if os.path.isfile(sys.argv[1])
+       else json.loads(sys.argv[1]))
+# The object-reference answer is unique. Publishing multiple markers, text, or
+# point lists on the scored topic leaves evaluator behaviour ambiguous.
+if isinstance(raw, list):
+    if len(raw) != 1:
+        raise SystemExit("object-reference output requires exactly one box")
+    specs = raw
+else:
+    specs = [raw]
 
 rclpy.init()
 node = Node("selected_object_marker_pub")
 pub = node.create_publisher(Marker, "/selected_object_marker", 5)
+debug_pub = node.create_publisher(Marker, "/selected_object_debug_marker", 5)
 
 markers = []
+debug_markers = []
 for k, spec in enumerate(specs):
     cx, cy, cz = spec["center"]
     yaw = float(spec.get("yaw", 0.0))
@@ -72,7 +81,8 @@ for k, spec in enumerate(specs):
     txt.scale.z = 0.10
     txt.color.r = txt.color.g = txt.color.b = txt.color.a = 1.0
     txt.text = label
-    markers += [box, txt]
+    markers.append(box)
+    debug_markers.append(txt)
     print(f"  {label}: c=({cx:.2f},{cy:.2f},{cz:.2f}) L={L:.3f} W={W:.3f} "
           f"H={H:.3f} yaw={math.degrees(yaw):.1f}deg")
 
@@ -102,9 +112,12 @@ try:
         for mk in markers:
             mk.header.stamp = now
             pub.publish(mk)
+        for mk in debug_markers:
+            mk.header.stamp = now
+            debug_pub.publish(mk)
         if pts_marker is not None:
             pts_marker.header.stamp = now
-            pub.publish(pts_marker)
+            debug_pub.publish(pts_marker)
         rclpy.spin_once(node, timeout_sec=0.3)
 except KeyboardInterrupt:
     pass

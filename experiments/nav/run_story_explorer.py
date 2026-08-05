@@ -1,25 +1,14 @@
 #!/usr/bin/env python3
-"""Qwen-led semantic active exploration with SAM3 as an optional assistant.
+"""Legacy compatibility entry point and shared navigation helpers.
 
-Qwen first writes a verbose, image-grounded story for a 360 panorama. A second
-Qwen role receives the story, question, accumulated exploration history, map
-coverage, and a list of safe geometric viewpoints. It may ask SAM3 to localize
-Qwen-authored text queries in the same panorama, then personally inspect SAM's
-marked results and crops. Qwen ultimately chooses one of:
-
-    answer   - evidence is complete enough to return the result
-    zoom     - enlarge a question-relevant region in the current panorama
-    ask_sam  - use SAM as a subordinate pixel-localization tool
-    verify   - approach a visible but ambiguous/too-small part of the story
-    explore  - inspect an unseen/occluded region that could change the answer
-
-SAM never answers, counts, or navigates. Qwen chooses semantic goals and safe
-candidate IDs; it never invents map-frame coordinates. Candidate coordinates
-come from the allowed terrain map.
+Running this file now redirects to ``run_question.py`` and its restored
+single-Qwen + SAM + lidar coverage loop.  The experimental storyteller,
+auditor, occlusion, and fusion chain remains below only so geometry helpers used
+by other tools stay import-compatible; it is not launched.
 
 Run from experiments/nav using the host SAM/Qwen environment:
 
-    python run_story_explorer.py "How many golden Buddha figures are present?"
+    python run_story_explorer.py "How many pillows are on the floor?"
 """
 
 from __future__ import annotations
@@ -37,47 +26,47 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from agent import VLMAgent, _json
 from coverage import Coverage
+from live_trace import LiveTrace, launch_dashboard
 
 
 CONTAINER = "iros2026_system"
 STACK = "/home/docker/autonomy_stack_mecanum_wheel_platform"
-ROS_DOMAIN_ID = os.environ.get("STORY_ROS_DOMAIN_ID", "67")
+ROS_DOMAIN_ID = os.environ.get("STORY_ROS_DOMAIN_ID", "77")
 
 
-OBSERVER_SYSTEM = """You are the grounded visual observer of a mobile robot.
-You see a 1920x640 equirectangular panorama with 360-degree horizontal and
-120-degree vertical field of view. The left and right image edges touch. Your
-job is to create a meticulous semantic record of what is ACTUALLY visible.
+OBSERVER_SYSTEM = """You are the visual storyteller for a mobile robot. You see
+one raw 360-degree panorama from a single camera position. Write a rich, plain-
+language account of the scene exactly as it appears.
 
-Separate direct observations from uncertainty and inference. Never turn a
-plausible hidden object into an observed fact. Inspect small shelf, wall,
-tabletop, cabinet, and floor items carefully. Mention occluders, entrances,
-corners, surfaces, partly hidden regions, and objects too small to classify.
-Use panorama sectors S0-S11, ordered left-to-right, so later reasoning can refer
-back to physical directions. S0 is the far-left 1/12 of the image and S11 the
-far-right 1/12; remember S0 and S11 are adjacent because the image wraps.
+Describe the room, openings, furniture, surfaces, decorations, floor, walls,
+and every visible object, including small or partly hidden things. Use natural
+relationships such as left of, behind, near, on top of, and around. Distinguish
+what is visibly present from what is unclear or blocked. Remember that the left
+and right image edges touch in a panorama and that one camera position cannot
+see through opaque objects.
 
-A single compressed panorama is NOT proof that a small object is absent. Never
-claim that every shelf, console, cabinet, tabletop, floor edge, or area behind
-furniture has been inspected at close range. If the question concerns a small
-item, explicitly list every plausible visible support/display surface and state
-whether its contents are large enough to identify."""
+Do only this observational job. Do not produce IDs, schemas, JSON, task answers,
+confidence scores, action choices, or robot navigation language. Do not discuss
+these instructions. Return only the verbose natural-language scene story."""
 
 
 INVESTIGATOR_SYSTEM = """You are the active-perception investigator controlling
-what a robot observes next. In the initial investigation call you do not see the
-image; you receive verbatim grounded stories written by a visual observer,
-geometric map coverage, robot poses, prior failed actions, and safe candidate
-viewpoints. If you call the SAM assistant, a follow-up call will show you SAM's
-marked panorama and contextual crops.
+what a robot observes next. In every investigation call you see the CURRENT
+panorama as well as verbatim grounded stories written by a separate visual
+observer, robot poses, prior failed actions, and safe candidate viewpoints
+provided by navigation. The observer may be wrong: independently inspect the
+pixels before accepting its count, boxes, spatial claims, or completeness.
+If you call the SAM assistant, a follow-up call will show you SAM's marked
+panorama and contextual crops.
 
-You also have a deterministic ZOOM tool for the SAME panorama. It accepts
-Qwen-selected S0-S11 sectors and returns an enlarged crop while preserving the
-full panorama as context. Zoom changes visual-token allocation, not reality: it
+You also have a deterministic ZOOM tool for the SAME panorama. It accepts a
+Qwen-selected normalized image box [x0,y0,x1,y1] and returns an enlarged crop
+while preserving the full panorama as context. Zoom changes visual-token
+allocation, not reality: it
 cannot reveal a hidden surface or create evidence absent from the captured
 pixels. Prefer zoom before movement when relevant pixels are already visible
 but small, crowded, overlapping, or require a relationship-aware count.
@@ -113,16 +102,15 @@ merged instances or an unaudited slot. If those pixels already exist, use zoom;
 if the necessary side is truly hidden, move. Never invent an instance merely
 to satisfy symmetry.
 
-ZOOM TOOL: Choose status=zoom and provide zoom_requests only for a region that
-is already in the current panorama. Each request must name one or more S0-S11
-sectors, a vertical band (upper, middle, lower, or full), the semantic target,
-and the exact uncertainty the crop will resolve. Prefer one context-preserving
-crop containing the entire supporting object and all related instances over
-separate tiny crops. Zoom is cheaper than SAM or motion. Set answer=null and
-selected_viewpoint_id=null while using it.
+ZOOM TOOL: Choose status=zoom only for a region already in the current
+panorama. Each request must give one normalized 0..1000 bbox enclosing the
+complete semantic target, its supporting object, and all related instances,
+plus the exact uncertainty the crop will resolve. The box may cross the wrap
+seam by using x0>x1. Prefer one context-preserving crop over separate tiny
+crops. Set answer=null and selected_viewpoint_id=null while using it.
 
 SAM ASSISTANT: You may choose status=ask_sam and submit text localization
-questions for the SAME panorama, optionally restricted to S0-S11. You decide
+questions for the SAME panorama. You decide
 what to ask based on the question and scene story. SAM only proposes masks and
 does not understand the room, prove identity, count instances, or choose where
 to move. After it responds, YOU inspect its marked panorama and enlarged crops,
@@ -136,9 +124,9 @@ choose a new robot viewpoint for that.
 
 ACTION-CONSISTENCY RULE: rank hypotheses by expected decision value, not merely
 by novelty. The selected viewpoint must test the first unresolved hypothesis.
-When that hypothesis names a panorama sector and a safe directional candidate
-exists for it, choose that candidate. Choose a generic coverage frontier only
-when it has greater expected decision value and explain the comparison.
+Choose a candidate whose position and relative bearing can reveal the named
+hidden side or improve the named object view. Choose a generic coverage
+frontier only when it has greater expected decision value and explain why.
 
 STOP-CONSISTENCY RULE: status=answer means the answer is complete enough to
 stop. In that case confirmed_lower_bound and possible_upper_bound must agree
@@ -154,7 +142,124 @@ an object is absent. Do not return an exact zero from the first panorama for a
 typically small object while any table, shelf, media console, cabinet, ledge,
 corner, occluder, adjoining area, or geometric frontier remains unresolved.
 First choose a viewpoint that enlarges the most plausible support/display area.
-This is a general small-object rule, not an object-specific association."""
+This is a general small-object rule, not an object-specific association.
+
+OBSERVER--INVESTIGATOR COMMUNICATION: The observer's direct answer and stated
+confidence are claims to audit, not authority. Cross-examine its inventory
+against its own layout, instance list, support topology, and occluders. Before
+accepting a first-view count, try to construct the best counterexample: a
+specific hidden side, overlap, foreground item, continuation, or unresolved
+support region that could change it. If one exists, immediately choose the
+physical or visual action that tests it. Write `semantic_goal` and
+`expected_observation` as precise instructions to the next observer; that
+observer will receive them after motion and report an additive story update.
+
+Do not spend a sensor action merely to repair malformed JSON or a missing
+ledger field. Reconstruct formatting from grounded prose. Move when evidence is
+hidden; zoom only when the relevant pixels are genuinely present but small.
+For repeated movable objects clustered around/on/under an opaque anchor, a
+single clear-looking side is not completeness. Unless the observer gives
+positive pixel evidence that the full support topology/perimeter is visible,
+treat the current count as a lower bound and seek parallax early."""
+
+
+TARGET_AUDITOR_SYSTEM = """You are an independent visual auditor. You receive
+one raw panorama and one question, but no scene story, prior count, or other
+agent's conclusion. Inspect the pixels yourself.
+
+Enumerate every CURRENTLY VISIBLE physical instance relevant to the question.
+Separate overlapping instances using contours, gaps, shading, floor contact,
+and relative position around visible anchors. A visible count is only a lower
+bound on the room total: do not claim that unseen space is empty and do not
+decide whether the robot should stop or move. Use natural spatial descriptions,
+not image partitions. Return concise reasoning followed by one JSON object."""
+
+
+def target_auditor_prompt(question: str) -> str:
+    return f"""QUESTION:
+{question}
+
+Perform a fresh pixel-level audit without any prior answer. First list every
+distinct visible candidate and what visually separates it from its neighbors.
+Then state visible ambiguities and which objects or surfaces block other areas.
+
+End with exactly one JSON object:
+{{
+  "visible_instances": [
+    {{"id":"V1","description":"<one visible physical instance>",
+      "relation_to_anchor":"<natural position>",
+      "distinguishing_evidence":"<contour/gap/contact evidence>",
+      "confidence":"high|medium|low"}}
+  ],
+  "visible_count_lower_bound": <integer>,
+  "ambiguous_visible_candidates": ["<possibly merged/unclear candidate>"],
+  "visible_occluders": ["<object blocking relevant support or floor>"],
+  "cannot_see": ["<specific area absent from this line of sight>"]
+}}"""
+
+
+OCCLUSION_ANALYST_SYSTEM = """You are an independent monocular spatial-
+perception analyst. You receive one raw 360-degree panorama from ONE camera
+center and a task question only for relevance. You do not receive another
+agent's story, count, or conclusion. Do not answer or count the requested
+objects. Build an image-grounded depth/occlusion graph.
+
+Infer ordinal depth only: near/middle/far, using overlap and T-junctions, floor
+contact position, relative scale when comparable, perspective, and which contour
+continues behind another. A panorama covers all horizontal bearings but provides
+no view of the rear side of any opaque object. Every claimed hidden region must
+name its pixel-visible occluder; every claimed complete region must name the
+pixels or opening that expose it. A target not currently visible may or may not
+exist, so label hidden regions as hypotheses, never observations.
+
+Audit the other observer adversarially. If it says a surface or perimeter is
+complete, check that front, lateral, far/back, and under/over relationships are
+actually visible from this camera center. Recommend a relative view change only
+when it would reveal a specific image-inferred occlusion. This analysis is
+general for furniture, walls, shelves, containers, people, and all other opaque
+objects; do not use an object-specific rule."""
+
+
+def occlusion_analyst_prompt(question: str) -> str:
+    return f"""EXACT TASK QUESTION (for relevance only; do not answer it):
+{question}
+
+First inspect the panorama independently in fixed left-to-right order. Then
+construct ordinal depth and occlusion relations for question-relevant supports
+and nearby opaque objects. A 360-degree image supplies bearings from one camera
+center, not visibility through furniture. For each opaque object touching or
+crossing a relevant floor/support area, decide whether its far side and the
+surface behind it are actually visible. Do not use absence from prose as
+negative evidence because no prose is provided.
+
+Return concise reasoning followed by exactly one JSON object:
+{{
+  "depth_order": [
+    {{"id":"O1","object":"<visible object>",
+      "depth":"near|middle|far","image_cues":["<overlap/floor/scale cue>"]}}
+  ],
+  "occlusion_edges": [
+    {{"occluder_id":"O1","hides":"<specific surface/space/object part>",
+      "evidence":"<visible contour/overlap evidence>",
+      "could_affect_question":true}}
+  ],
+  "target_support_visibility": {{
+    "visible_regions":["<region>"],
+    "hidden_regions":["<region hidden by named occluder>"],
+    "complete_from_this_pose":false,
+    "reason":"<image-grounded>"
+  }},
+  "completeness_audit": {{
+    "completeness_supported_by_pixels":false,
+    "specific_risk":"<or none>"
+  }},
+  "recommended_view_change": {{
+    "needed":true,
+    "relative_direction":"left|right|forward|back|around",
+    "reveal":"<specific hidden region>",
+    "success_evidence":"<what new pixels settle the hypothesis>"
+  }}
+}}"""
 
 
 def docker(command: str, timeout: int = 180) -> str:
@@ -175,7 +280,7 @@ def ros(command: str, timeout: int = 180) -> str:
 
 def install_helpers() -> None:
     here = Path(__file__).resolve().parent
-    for name in ("capture.py", "send_waypoint.py"):
+    for name in ("capture.py", "send_waypoint.py", "far_bridge.py"):
         subprocess.run(
             ["docker", "cp", str(here / name), f"{CONTAINER}:/tmp/{name}"],
             check=True,
@@ -207,21 +312,6 @@ def capture(run_dir: Path, iteration: int, seconds: float = 4.0) -> dict:
         "terrain": terrain,
         "capture_log": output,
     }
-
-
-def sector_overlay(image: Image.Image) -> Image.Image:
-    """Draw the exact S0-S11 boundaries Qwen is asked to reference."""
-    canvas = image.copy()
-    draw = ImageDraw.Draw(canvas, "RGBA")
-    step = canvas.width / 12.0
-    for sector in range(12):
-        x0 = int(round(sector * step))
-        x1 = int(round((sector + 1) * step))
-        draw.line((x0, 0, x0, canvas.height), fill=(0, 220, 255, 150), width=2)
-        draw.rectangle((x0 + 3, 3, min(x1 - 3, x0 + 48), 27),
-                       fill=(0, 0, 0, 175))
-        draw.text((x0 + 7, 6), f"S{sector}", fill=(0, 255, 255, 255))
-    return canvas
 
 
 def yaw_from_quaternion(q: np.ndarray) -> float:
@@ -261,6 +351,13 @@ def safe_viewpoints(terrain: np.ndarray | None, pose: np.ndarray,
     if not len(free):
         return []
 
+    # A measured point alone is not enough space for the vehicle footprint.
+    # Require every cell under the robot to be known traversable; UNKNOWN is
+    # appropriate as an observation target, never as a physical endpoint.
+    free = free[np.array([coverage.is_safe_xy(point) for point in free], bool)]
+    if not len(free):
+        return []
+
     rel_map = np.array([angle_wrap(math.atan2(p[1] - robot[1], p[0] - robot[0])
                                    - heading) for p in free])
     # project.py's calibrated sensor<-camera rotation maps positive panorama
@@ -268,28 +365,24 @@ def safe_viewpoints(terrain: np.ndarray | None, pose: np.ndarray,
     pano_az = np.array([angle_wrap(-a) for a in rel_map])
     dist = np.linalg.norm(free - robot, axis=1)
     out = []
-    # One useful point for each panorama direction. Relative bearing -180 is
-    # the left edge, 0 is panorama centre, and +180 wraps to the right edge.
-    for sector in range(12):
-        centre = -math.pi + (sector + 0.5) * (2.0 * math.pi / 12.0)
-        angular = np.abs(np.array([angle_wrap(a - centre) for a in pano_az]))
-        eligible = np.where(angular <= math.radians(20))[0]
-        if not len(eligible):
-            continue
-        # About 2 m gives meaningful parallax without making every trip costly.
-        cost = angular[eligible] * 1.5 + np.abs(dist[eligible] - 2.0)
-        k = int(eligible[int(np.argmin(cost))])
+    # Greedily choose spatially separated points at a useful travel distance.
+    ordering = np.argsort(np.abs(dist - 2.0))
+    for raw_index in ordering:
+        k = int(raw_index)
         p = free[k]
-        if any(np.linalg.norm(p - np.asarray(v["xy"])) < 0.35 for v in out):
+        if any(np.linalg.norm(p - np.asarray(v["xy"])) < 0.65 for v in out):
             continue
         out.append({
             "id": f"V{len(out)}",
             "xy": [round(float(p[0]), 3), round(float(p[1]), 3)],
-            "panorama_sector": f"S{sector}",
-            "panorama_bearing_deg": round(math.degrees(pano_az[k]), 1),
+            "relative_bearing_deg": round(math.degrees(pano_az[k]), 1),
+            "panorama_x_norm": round(
+                (pano_az[k] + math.pi) / (2.0 * math.pi) * 1000.0, 1),
             "travel_m": round(float(dist[k]), 2),
-            "kind": "directional_inspection",
+            "kind": "inspection_viewpoint",
         })
+        if len(out) >= max(1, max_candidates - 1):
+            break
 
     frontier, gain = coverage.next_viewpoint(robot, min_gain=5)
     if frontier is not None:
@@ -299,8 +392,9 @@ def safe_viewpoints(terrain: np.ndarray | None, pose: np.ndarray,
         out.append({
             "id": f"V{len(out)}",
             "xy": [round(float(p[0]), 3), round(float(p[1]), 3)],
-            "panorama_sector": f"S{min(11, int((panorama_bearing + math.pi) / (2 * math.pi) * 12))}",
-            "panorama_bearing_deg": round(math.degrees(panorama_bearing), 1),
+            "relative_bearing_deg": round(math.degrees(panorama_bearing), 1),
+            "panorama_x_norm": round(
+                (panorama_bearing + math.pi) / (2.0 * math.pi) * 1000.0, 1),
             "travel_m": round(float(np.linalg.norm(p - robot)), 2),
             "kind": "coverage_frontier",
             "expected_new_cells": int(gain),
@@ -308,75 +402,122 @@ def safe_viewpoints(terrain: np.ndarray | None, pose: np.ndarray,
     return out[:max_candidates]
 
 
-def observer_prompt(question: str, iteration: int, history_summary: str) -> str:
-    return f"""QUESTION THE ROBOT MUST EVENTUALLY ANSWER:
-{question}
-
-This is observation iteration {iteration}. Describe the entire panorama
-exhaustively, not merely the most salient objects. Then perform a second,
-question-focused audit of every potentially relevant visible object and every
-area where additional evidence might be hidden. The question is supplied to
-direct attention, not to encourage you to hallucinate its requested object.
-
-The cyan lines and S0-S11 labels are an overlay added by the robot. Use those
-exact boundaries. For every visible table, shelf, console, cabinet, ledge, and
-display surface, inventory its contents or explicitly say that its contents are
-too small to resolve. Do not treat "I did not recognize the requested object"
-as proof of zero.
-
-For any repeated or structured question-relevant group, enumerate distinct
-instances by position relative to its anchor (for example, which side of a
-supporting surface), and explicitly mention overlapping, partially occluded, or
-possibly merged instances. Do not infer a missing object from symmetry, but do
-flag a visible arrangement that deserves a closer pixel audit.
-
-PRIOR EXPLORATION SUMMARY:
-{history_summary or '(first observation; no prior story)'}
-
-Write a verbose narrative first. End with a JSON object using this schema:
-{{
-  "visible_layout": "<room areas, entrances and main occluders>",
-  "task_relevant_visible": [
-    {{"description":"<grounded observation>","sector":"S0-S11",
-      "confidence":"high|medium|low","why_uncertain":"<or empty>"}}
-  ],
-  "uncertain_visible": ["<tiny, ambiguous, or look-alike evidence>"],
-  "support_surfaces_needing_close_audit": [
-    {{"surface":"<table/shelf/console/cabinet/ledge>","sector":"S0-S11",
-     "reason":"<why its small contents are unresolved>"}}
-  ],
-  "occluded_or_unseen_regions": [
-    {{"region":"<semantic area>","sector":"S0-S11",
-      "occluder":"<what blocks it>","could_affect_question":true}}
-  ],
-  "direct_answer_if_visually_certain": "<answer or unknown>",
-  "completeness_concern": "<what prevents an exact answer, or none>"
-}}"""
+def observer_prompt(iteration: int) -> str:
+    return f"""Describe observation {iteration} as one detailed natural-language
+story. Slowly scan the complete panorama, including foreground and both wrap
+edges. Describe what is visibly present, how objects relate to one another, what
+overlaps, and what opaque objects prevent this camera position from seeing.
+Stay image-grounded and return plain prose only."""
 
 
-def investigator_prompt(question: str, records: list[dict], coverage_stats: dict,
+def persistent_scene_memory(records: list[dict]) -> dict:
+    """Keep confirmed evidence across poses instead of replacing it per view."""
+    instances = {}
+    confirmed_floor = 0
+    best_evidence = ""
+    for record in records:
+        decision = record.get("decision") or {}
+        ledger = decision.get("instance_ledger") or []
+        for entry in ledger:
+            if not isinstance(entry, dict) or not entry.get("id"):
+                continue
+            instance_id = str(entry["id"]).strip()
+            confidence = str(entry.get("confidence", "high")).lower()
+            if confidence not in {"high", "medium"}:
+                continue
+            previous = instances.get(instance_id, {})
+            instances[instance_id] = {
+                **previous,
+                **entry,
+                "id": instance_id,
+                "first_confirmed_view": previous.get(
+                    "first_confirmed_view", record["iteration"]),
+                "last_supported_view": record["iteration"],
+            }
+        try:
+            lower = int(decision.get("confirmed_lower_bound"))
+        except (TypeError, ValueError):
+            lower = 0
+        lower = max(lower, len(instances))
+        if lower >= confirmed_floor:
+            confirmed_floor = lower
+            best_evidence = str(decision.get("best_evidence") or best_evidence)
+    return {
+        "confirmed_lower_bound": confirmed_floor,
+        "confirmed_instances": list(instances.values()),
+        "best_historical_evidence": best_evidence,
+        "rule": ("Current non-visibility does not erase these facts. Remove an "
+                 "instance only with positive duplicate/misidentification evidence."),
+    }
+
+
+def exploration_history_summary(records: list[dict], current_pose: np.ndarray) -> str:
+    if not records:
+        return ""
+    lines = ["PERSISTENT WORLD MEMORY:",
+             json.dumps(persistent_scene_memory(records), indent=2)]
+    lines.append("\nPRIOR OBSERVATIONS:")
+    for record in records:
+        decision = record.get("decision") or {}
+        lines.append(
+            f"Observation {record['iteration']} at "
+            f"({record['pose'][0]:.2f},{record['pose'][1]:.2f}): "
+            f"decision={decision.get('status', 'pending')}, "
+            f"answer={decision.get('answer')}")
+    movement = records[-1].get("movement") or {}
+    candidate = movement.get("candidate") or {}
+    target = candidate.get("xy")
+    if target:
+        error = float(np.linalg.norm(
+            np.asarray(current_pose[:2], float) - np.asarray(target, float)))
+        lines.extend([
+            "\nPOST-MOVE ARRIVAL CHECK:",
+            f"requested viewpoint: {candidate.get('id')} at {target}",
+            f"captured pose: [{current_pose[0]:.3f}, {current_pose[1]:.3f}]",
+            f"position error: {error:.3f} m",
+            f"navigation reported arrival: {movement.get('arrived', False)}",
+            f"semantic goal: {movement.get('semantic_goal', '')}",
+            f"expected observation: {movement.get('expected_observation', '')}",
+        ])
+    return "\n".join(lines)
+
+
+def investigator_prompt(question: str, records: list[dict],
                         candidates: list[dict], seconds_left: float) -> str:
     stories = []
     for record in records:
         stories.append(
             f"=== OBSERVATION {record['iteration']} AT MAP POSE "
             f"({record['pose'][0]:.2f}, {record['pose'][1]:.2f}) ===\n"
-            f"{record['story']}"
+            f"SEMANTIC OBSERVER:\n{record['story']}\n\n"
+            f"BLIND TARGET AUDITOR:\n"
+            f"{record.get('target_audit', '(not available)')}\n\n"
+            f"MONOCULAR OCCLUSION ANALYST:\n"
+            f"{record.get('occlusion_analysis', '(not available)')}"
         )
     candidate_text = json.dumps(candidates, indent=2)
+    memory_text = json.dumps(persistent_scene_memory(records), indent=2)
     return f"""EXACT QUESTION:
 {question}
 
+PERSISTENT WORLD MEMORY ACROSS VIEWPOINTS:
+{memory_text}
+
 VERBATIM GROUNDED OBSERVATION STORIES:
 {chr(10).join(stories)}
-
-GEOMETRIC COVERAGE (sensor-derived, not an LLM claim):
-{json.dumps(coverage_stats, indent=2)}
 
 SAFE CANDIDATE VIEWPOINTS:
 {candidate_text if candidates else '(none available)'}
 
 TIME LEFT: {seconds_left:.0f} seconds
+
+The attached image is the CURRENT panorama. Before relying on the observer's
+conclusion, perform your own fixed left-to-right scan, including the foreground,
+and compare every visible candidate against its instance list and the monocular
+occlusion analyst's graph. Use overlap, floor contact, perspective, relative
+scale, and T-junctions to audit whether opaque anchors hide a back/far/under
+side. Explicitly state where your visual audit agrees or disagrees with the
+observer and geometry analyst.
 
 Reason carefully and verbosely. First identify the best-supported answer and
 the exact evidence for it. Then audit whether any visible ambiguity or plausible
@@ -389,6 +530,26 @@ Explicitly compare information gain, probability of changing the answer,
 travel cost, and redundancy before selecting an action. A frontier's large
 geometric area is not by itself more valuable than a close view of a
 question-relevant surface.
+
+Fuse observations additively. Preserve every previously confirmed instance and
+its stable ID when it is occluded or absent from the current line of sight. A
+current view of only part of a known group is not a smaller world count. Lower
+a historical count only when positive current evidence proves a duplicate or
+misidentification; record that exceptional correction in `memory_corrections`
+with prior_id, correction, and direct evidence. If the most recent
+arrival_audit says the requested semantic goal or complete target group is not
+visible, that viewpoint did not settle the hypothesis: retain the old facts and
+select a materially better viewpoint.
+
+The observer can be confidently wrong. Audit rather than echo its declared
+answer: (1) match the claimed count to separate instance entries, pixel boxes,
+and object-relative positions, (2) inspect foreground, overlaps, and objects at
+the panorama wrap seam, (3) identify the
+opaque anchor's unseen side, and (4) decide whether zoom pixels or parallax can
+actually settle that uncertainty. On the first view, prefer an early targeted
+move over an exact answer whenever one specific hidden side could contain an
+additional instance. Your `semantic_goal` is a message to the next visual
+observer, so name the anchor, hidden side, and required success/failure evidence.
 
 Choose zoom when the leading uncertainty is contained in visible pixels but
 the panorama allocates too little detail to separate instances or audit their
@@ -414,14 +575,19 @@ End with exactly one JSON object:
   "possible_upper_bound": <integer|null>,
   "best_evidence": "<grounded evidence>",
   "hypotheses": [
-    {{"region":"<semantic region, include S# when grounded in a sector>",
+    {{"region":"<semantic region relative to visible anchors>",
       "rationale":"<generalized reason>",
       "could_change_answer":true,"evidence_needed":"<observable test>"}}
   ],
   "instance_ledger": [
     {{"id":"I1","description":"<one physical instance>",
-      "sector":"S#","relation_to_anchor":"<side/position/support>",
-      "confidence":"high|medium|low"}}
+      "relation_to_anchor":"<side/position/support>",
+      "confidence":"high|medium|low",
+      "current_visibility":"visible|occluded|not_resolved_in_current_view"}}
+  ],
+  "memory_corrections": [
+    {{"prior_id":"I#","correction":"duplicate|misidentification",
+      "direct_evidence":"<positive evidence; current non-visibility is invalid>"}}
   ],
   "structural_completeness": {{
     "anchor":"<supporting object/group or none>",
@@ -430,13 +596,12 @@ End with exactly one JSON object:
     "audit_complete": true
   }},
   "zoom_requests": [
-    {{"sectors":"S# or S#-S#","vertical":"upper|middle|lower|full",
+    {{"bbox_norm":[0,0,1000,1000],
       "target":"<complete semantic region to enlarge>",
       "purpose":"<uncertainty this resolves>"}}
   ],
   "sam_requests": [
     {{"query":"<what Qwen wants SAM to mark>",
-      "sector":"S0-S11 or all",
       "purpose":"<which hypothesis this tests and how>"}}
   ],
   "selected_viewpoint_id": "V0 or null",
@@ -458,7 +623,10 @@ def forced_answer_prompt(question: str, records: list[dict]) -> str:
     evidence = []
     for record in records:
         evidence.append(
-            f"OBSERVATION {record['iteration']}:\n{record['story']}")
+            f"OBSERVATION {record['iteration']}:\n{record['story']}\n\n"
+            f"BLIND TARGET AUDIT:\n{record.get('target_audit', '(none)')}\n\n"
+            f"BLIND OCCLUSION AUDIT:\n"
+            f"{record.get('occlusion_analysis', '(none)')}")
         for exchange in record.get("zoom_exchanges") or []:
             evidence.append(
                 f"ZOOM VISUAL AUDIT {record['iteration']}.{exchange['round']}:\n"
@@ -483,21 +651,6 @@ Reason verbosely, then end with JSON:
   "best_evidence":"<short>","stop_reason":"budget exhausted"}}"""
 
 
-def unsafe_first_view_zero(question: str, decision: dict, iteration: int,
-                           coverage_stats: dict) -> bool:
-    """Reject a first-panorama zero when visibility/completeness is unresolved."""
-    if iteration != 0 or not question.strip().lower().startswith("how many"):
-        return False
-    try:
-        answer = int(decision.get("answer"))
-    except (TypeError, ValueError):
-        return False
-    return answer == 0 and (
-        coverage_stats.get("unexplored_edge_m2", 0) > 0 or
-        coverage_stats.get("seen_of_mapped", 0) < 0.95
-    )
-
-
 def unresolved_first_view_regions(question: str, decision: dict,
                                   records: list[dict]) -> str | None:
     """Reject a first-view count when its own observer flags relevant occlusion."""
@@ -506,6 +659,16 @@ def unresolved_first_view_regions(question: str, decision: dict,
             str(decision.get("status", "")).lower() != "answer"):
         return None
     observer = records[-1].get("observer_json") or {}
+    topology = observer.get("support_topology") or {}
+    if (topology.get("parallax_required") is True or
+            topology.get("closed_perimeter_visible") is False):
+        anchor = str(topology.get("anchor") or "question-relevant anchor")
+        sides = topology.get("occluded_sides") or []
+        return (
+            "first-view count is only a lower bound because the observer's "
+            f"support-topology audit says {anchor} hides {sides or 'a relevant side'}. "
+            "Communicate this as the leading hypothesis and choose a lateral/opposite "
+            "physical viewpoint; zoom cannot reveal an occluded side")
     affecting = [region for region in
                  observer.get("occluded_or_unseen_regions", [])
                  if isinstance(region, dict) and
@@ -515,8 +678,8 @@ def unresolved_first_view_regions(question: str, decision: dict,
     labels = []
     for region in affecting[:6]:
         label = str(region.get("region", "unseen region"))
-        sector = str(region.get("sector", "")).strip()
-        labels.append(f"{label} ({sector})" if sector else label)
+        location = str(region.get("location", "")).strip()
+        labels.append(f"{label} ({location})" if location else label)
     return ("first-view answer is incomplete because the grounded observer "
             "explicitly marked answer-relevant occluded/unseen regions: " +
             "; ".join(labels) +
@@ -524,45 +687,40 @@ def unresolved_first_view_regions(question: str, decision: dict,
             "cannot resolve unseen space")
 
 
-def _sector_numbers(value) -> set[int]:
-    """Extract S0-S11 references, including forms such as S6-S9 or S6–S9."""
-    text = (json.dumps(value, ensure_ascii=False)
-            if not isinstance(value, str) else value)
-    sectors = {int(v) for v in re.findall(r"\bS\s*(\d{1,2})\b", text, re.I)
-               if 0 <= int(v) <= 11}
-    ranges = re.findall(
-        r"\bS\s*(\d{1,2})\s*[-–—]\s*S?\s*(\d{1,2})\b", text, re.I)
-    for start_text, end_text in ranges:
-        start, end = int(start_text), int(end_text)
-        if 0 <= start <= 11 and 0 <= end <= 11:
-            lo, hi = sorted((start, end))
-            sectors.update(range(lo, hi + 1))
-    return sectors
+def _normalized_bbox(value) -> list[float] | None:
+    """Validate a continuous 0..1000 panorama box; x0>x1 means wrap seam."""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        box = [float(item) for item in value]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(item) and 0.0 <= item <= 1000.0 for item in box):
+        return None
+    x0, y0, x1, y1 = box
+    if abs(x1 - x0) < 1.0 or y1 - y0 < 1.0:
+        return None
+    return [round(item, 2) for item in box]
 
 
-def _zoom_sector_numbers(text: str) -> set[int]:
-    """Parse sector ranges along their shortest circular panorama arc."""
-    sectors = {int(value) for value in
-               re.findall(r"\bS\s*(\d{1,2})\b", text, re.I)
-               if 0 <= int(value) <= 11}
-    ranges = re.findall(
-        r"\bS\s*(\d{1,2})\s*[-–—]\s*S?\s*(\d{1,2})\b", text, re.I)
-    for start_text, end_text in ranges:
-        start, end = int(start_text), int(end_text)
-        if not (0 <= start <= 11 and 0 <= end <= 11):
-            continue
-        clockwise = [start]
-        while clockwise[-1] != end:
-            clockwise.append((clockwise[-1] + 1) % 12)
-        counterclockwise = [start]
-        while counterclockwise[-1] != end:
-            counterclockwise.append((counterclockwise[-1] - 1) % 12)
-        sectors.update(min((clockwise, counterclockwise), key=len))
-    return sectors
+def _boxes_in(value) -> list[list[float]]:
+    boxes = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if re.sub(r"[^a-z0-9]", "", str(key).lower()) == "bboxnorm":
+                box = _normalized_bbox(item)
+                if box:
+                    boxes.append(box)
+            else:
+                boxes.extend(_boxes_in(item))
+    elif isinstance(value, list):
+        for item in value:
+            boxes.extend(_boxes_in(item))
+    return boxes
 
 
 def valid_zoom_requests(decision: dict, max_requests: int = 3) -> list[dict]:
-    """Validate semantic panorama-crop requests authored by Qwen."""
+    """Validate Qwen-authored continuous panorama crop requests."""
     out = []
     raw_requests = decision.get("zoom_requests") or []
     if isinstance(raw_requests, dict):
@@ -570,111 +728,66 @@ def valid_zoom_requests(decision: dict, max_requests: int = 3) -> list[dict]:
     for request in raw_requests:
         if not isinstance(request, dict):
             continue
-        sector_text = str(
-            request.get("sectors") or request.get("sector") or
-            request.get("zoom_request") or "").strip()
-        sectors = sorted(_zoom_sector_numbers(sector_text))
+        box = _normalized_bbox(
+            request.get("bbox_norm") or request.get("normalized_bbox"))
         target = str(request.get("target", "")).strip()[:160]
         purpose = str(
             request.get("purpose") or request.get("uncertainty_to_resolve") or
             request.get("reason") or "").strip()[:240]
-        vertical = str(
-            request.get("vertical") or request.get("vertical_band") or
-            "middle").strip().lower()
-        if not sectors or not target or not purpose:
+        if box is None or not target or not purpose:
             continue
-        if vertical not in {"upper", "middle", "lower", "full"}:
-            vertical = "middle"
-        out.append({
-            "sectors": sector_text[:64],
-            "sector_numbers": sectors,
-            "vertical": vertical,
-            "target": target,
-            "purpose": purpose,
-        })
+        out.append({"bbox_norm": box, "target": target, "purpose": purpose})
         if len(out) >= max_requests:
             break
     return out
 
 
 def suggested_zoom_request(decision: dict, issue: str) -> dict | None:
-    """Recover a safe semantic crop when Qwen's intended tool JSON is malformed."""
-    evidence = {
+    """Recover a crop from Qwen's visible-instance boxes, without a grid."""
+    boxes = _boxes_in({
         "instance_ledger": decision.get("instance_ledger") or [],
-        "structural_completeness": decision.get("structural_completeness") or {},
-        "best_evidence": decision.get("best_evidence", ""),
-    }
-    sectors = sorted(_sector_numbers(evidence))
-    if not sectors:
-        sectors = sorted(_sector_numbers(decision.get("hypotheses") or []))
-    if not sectors:
+        "hypotheses": decision.get("hypotheses") or [],
+    })
+    if not boxes:
         return None
+    # A seam-crossing box already expresses the minimal circular interval; do
+    # not combine it with ordinary boxes into an ambiguous linear union.
+    wrapped = next((box for box in boxes if box[0] > box[2]), None)
+    if wrapped:
+        union = wrapped
+    else:
+        union = [min(box[0] for box in boxes), min(box[1] for box in boxes),
+                 max(box[2] for box in boxes), max(box[3] for box in boxes)]
     structural = decision.get("structural_completeness") or {}
     anchor = str(structural.get("anchor") or "question-relevant visible group")
-    anchor_lower = anchor.lower()
-    if any(word in anchor_lower for word in ("wall", "painting", "picture", "shelf")):
-        vertical = "upper"
-    elif any(word in anchor_lower for word in ("floor", "rug")):
-        vertical = "lower"
-    else:
-        vertical = "middle"
-    return {
-        "sectors": ",".join(f"S{sector}" for sector in sectors),
-        "vertical": vertical,
-        "target": anchor[:160],
-        "purpose": issue[:240],
-    }
-
-
-def _minimal_sector_arc(sectors: list[int]) -> tuple[float, float]:
-    """Return the shortest circular [start,end] arc containing whole sectors."""
-    values = sorted(set(sectors))
-    if not values:
-        raise ValueError("at least one sector is required")
-    if len(values) == 12:
-        return 0.0, 12.0
-    # Remove the largest empty circular gap. The remaining arc may extend past
-    # sector 11, which is intentional: the crop function samples a tiled image.
-    gaps = []
-    for index, value in enumerate(values):
-        following = values[(index + 1) % len(values)]
-        gap = (following - value) % 12
-        gaps.append(gap)
-    gap_index = int(np.argmax(gaps))
-    start = float(values[(gap_index + 1) % len(values)])
-    unwrapped = [float(value if value >= start else value + 12)
-                 for value in values]
-    return start, max(unwrapped) + 1.0
+    return {"bbox_norm": union, "target": anchor[:160], "purpose": issue[:240]}
 
 
 def make_zoom_crop(image: Image.Image, request: dict,
-                   padding_sectors: float = 0.25) -> tuple[Image.Image, dict]:
-    """Crop a sector arc, including S11/S0 wrap, and enlarge deterministically."""
-    sectors = list(request["sector_numbers"])
-    start, end = _minimal_sector_arc(sectors)
-    span = end - start
-    if span < 12:
-        start -= padding_sectors
-        end += padding_sectors
+                   padding_fraction: float = 0.04) -> tuple[Image.Image, dict]:
+    """Crop a normalized box, supporting x0>x1 across the panorama seam."""
+    x0n, y0n, x1n, y1n = request["bbox_norm"]
+    pad_x = padding_fraction * 1000.0
+    pad_y = padding_fraction * 1000.0
+    y0n = max(0.0, y0n - pad_y)
+    y1n = min(1000.0, y1n + pad_y)
+    y0 = int(round(y0n / 1000.0 * image.height))
+    y1 = int(round(y1n / 1000.0 * image.height))
+    if x0n < x1n:
+        x0n = max(0.0, x0n - pad_x)
+        x1n = min(1000.0, x1n + pad_x)
+        source = image
+        x0 = int(round(x0n / 1000.0 * image.width))
+        x1 = int(round(x1n / 1000.0 * image.width))
     else:
-        start, end = 0.0, 12.0
-
-    vertical_bounds = {
-        "upper": (0.0, 0.62),
-        "middle": (0.08, 0.90),
-        "lower": (0.25, 1.0),
-        "full": (0.0, 1.0),
-    }
-    y_fraction = vertical_bounds[request["vertical"]]
-    y0 = int(round(y_fraction[0] * image.height))
-    y1 = int(round(y_fraction[1] * image.height))
-
-    tiled = Image.fromarray(np.concatenate(
-        [np.asarray(image)] * 3, axis=1))
-    step = image.width / 12.0
-    x0 = int(round((start + 12.0) * step))
-    x1 = int(round((end + 12.0) * step))
-    crop = tiled.crop((x0, y0, x1, y1))
+        x0n -= pad_x
+        x1n += pad_x
+        source = Image.fromarray(np.concatenate(
+            [np.asarray(image)] * 2, axis=1))
+        x0 = int(round(max(0.0, x0n) / 1000.0 * image.width))
+        x1 = int(round((min(1000.0, x1n) + 1000.0) /
+                       1000.0 * image.width))
+    crop = source.crop((x0, y0, x1, y1))
     longest = max(crop.size)
     scale = max(1.0, min(4.0, 1200.0 / max(1, longest)))
     zoom = crop.resize(
@@ -684,8 +797,7 @@ def make_zoom_crop(image: Image.Image, request: dict,
     )
     metadata = {
         **request,
-        "unwrapped_sector_arc": [round(start, 2), round(end, 2)],
-        "source_box_unwrapped": [x0, y0, x1, y1],
+        "source_box_pixels": [x0, y0, x1, y1],
         "crop_size": list(crop.size),
         "zoom_size": list(zoom.size),
         "scale": round(scale, 3),
@@ -711,7 +823,6 @@ def valid_sam_requests(decision: dict, max_requests: int = 6) -> list[dict]:
             continue
         out.append({
             "query": query,
-            "sector": str(request.get("sector", "all"))[:48],
             "purpose": str(request.get("purpose", ""))[:240],
         })
         if len(out) >= max_requests:
@@ -720,7 +831,8 @@ def valid_sam_requests(decision: dict, max_requests: int = 6) -> list[dict]:
 
 
 def decision_consistency_issue(decision: dict, candidates: list[dict],
-                               zoom_performed: bool = False) -> str | None:
+                               zoom_performed: bool = False,
+                               persistent_memory: dict | None = None) -> str | None:
     """Return a semantic/structural contradiction that Qwen must repair."""
     status = str(decision.get("status", "")).lower()
     if status == "answer":
@@ -740,6 +852,31 @@ def decision_consistency_issue(decision: dict, candidates: list[dict],
         except (TypeError, ValueError):
             count = None
         if count is not None:
+            historical_floor = int(
+                (persistent_memory or {}).get("confirmed_lower_bound") or 0)
+            known_ids = {
+                str(entry.get("id", "")).strip()
+                for entry in (persistent_memory or {}).get(
+                    "confirmed_instances", [])
+                if isinstance(entry, dict) and entry.get("id")
+            }
+            corrected_ids = {
+                str(item.get("prior_id", "")).strip()
+                for item in decision.get("memory_corrections") or []
+                if isinstance(item, dict)
+                and str(item.get("correction", "")).lower()
+                in {"duplicate", "misidentification"}
+                and str(item.get("direct_evidence", "")).strip()
+            } & known_ids
+            effective_floor = max(0, historical_floor - len(corrected_ids))
+            if count < effective_floor:
+                return (
+                    "current answer drops below persistent confirmed evidence: "
+                    f"answer={count}, historical_lower_bound={historical_floor}, "
+                    f"supported_corrections={len(corrected_ids)}. A new viewpoint "
+                    "showing fewer objects is occlusion/non-visibility, not deletion; "
+                    "preserve prior instances and choose another viewpoint if the "
+                    "move's semantic goal was not visible")
             ledger = [entry for entry in decision.get("instance_ledger") or []
                       if isinstance(entry, dict) and entry.get("id")]
             identifiers = {str(entry["id"]) for entry in ledger}
@@ -754,14 +891,21 @@ def decision_consistency_issue(decision: dict, candidates: list[dict],
                         "visible sides, overlaps, and continuation risk")
             risk = str(structural.get(
                 "overlap_or_continuation_risk", "")).strip().lower()
-            no_risk_values = {
-                "", "none", "no", "no risk", "none visible", "not applicable",
-                "no overlap", "no continuation risk",
-            }
+            # Qwen commonly adds a useful explanation after an unambiguous
+            # no-risk verdict (for example, "none — frames are spaced apart").
+            # Requiring an exact string match turns that extra grounding into a
+            # false failure and needlessly spends another zoom/model round.
+            no_risk_prefixes = (
+                "none", "no ", "no-", "zero", "not applicable", "n/a",
+            )
+            risk_is_clear = (
+                not risk or any(risk.startswith(prefix)
+                                for prefix in no_risk_prefixes)
+            )
             low_confidence = any(
                 str(entry.get("confidence", "high")).lower() != "high"
                 for entry in ledger)
-            if not zoom_performed and (risk not in no_risk_values or low_confidence):
+            if not zoom_performed and (not risk_is_clear or low_confidence):
                 return ("visible counting evidence still has overlap, continuation, "
                         "or low-confidence instance risk; use a context-preserving "
                         "zoom before answering")
@@ -793,29 +937,94 @@ def decision_consistency_issue(decision: dict, candidates: list[dict],
     unresolved = _first_unresolved_hypothesis(decision)
     if unresolved is None:
         return f"{status} has no hypothesis marked could_change_answer=true"
-    hypothesis_index, hypothesis = unresolved
-    sectors = _sector_numbers(hypothesis)
-    directional_sectors = {
-        int(v["panorama_sector"][1:]) for v in candidates
-        if v.get("kind") == "directional_inspection"
-        and str(v.get("panorama_sector", ""))[1:].isdigit()
-    }
-    testable = sectors & directional_sectors
-    selected_sector_text = str(selected.get("panorama_sector", ""))
-    selected_sector = (int(selected_sector_text[1:])
-                       if selected_sector_text[1:].isdigit() else None)
-    if testable and selected_sector not in testable:
-        expected = ", ".join(f"S{s}" for s in sorted(testable))
-        return (f"selected {selected_id} ({selected_sector_text}) does not test "
-                f"first unresolved hypothesis {hypothesis_index}; choose a "
-                f"directional candidate in {expected}, or rerank hypotheses")
+    return None
+
+
+def arrival_consistency_issue(records: list[dict], decision: dict) -> str | None:
+    """Do not let a poor post-move view masquerade as successful verification."""
+    if len(records) < 2:
+        return None
+    previous_move = records[-2].get("movement") or {}
+    if not previous_move:
+        return None
+    observer = records[-1].get("observer_json") or {}
+    audit = observer.get("arrival_audit") or {}
+    inadequate = (
+        audit.get("geometric_target_reached") is False or
+        audit.get("semantic_goal_visible") is False or
+        audit.get("complete_target_group_visible") is False or
+        audit.get("viewpoint_adequate") is False
+    )
+    if not inadequate:
+        return None
+    if str(decision.get("status", "")).lower() == "answer":
+        return (
+            "the post-move arrival audit says this viewpoint did not expose the "
+            "requested evidence or complete target group. Preserve persistent "
+            "instances, mark currently hidden members occluded, and select a "
+            "different safe viewpoint that tests the same semantic goal")
+    return None
+
+
+def target_audit_consistency_issue(records: list[dict],
+                                   decision: dict) -> str | None:
+    """Require the final answer to respect the blind pixel audit."""
+    if not records or str(decision.get("status", "")).lower() != "answer":
+        return None
+    audit = records[-1].get("target_audit_json") or {}
+    try:
+        visible_lower = int(audit.get("visible_count_lower_bound"))
+        answer = int(decision.get("answer"))
+    except (TypeError, ValueError):
+        visible_lower = answer = None
+    if (visible_lower is not None and answer is not None and
+            answer < visible_lower):
+        return ("answer is below the independent pixel audit's visible lower "
+                f"bound: answer={answer}, visible_lower_bound={visible_lower}")
+    ambiguous = audit.get("ambiguous_visible_candidates") or []
+    if ambiguous:
+        return ("the independent pixel audit found unresolved visible candidates: "
+                f"{ambiguous}. Use a context-preserving zoom or SAM localization "
+                "before answering")
+    return None
+
+
+def occlusion_consistency_issue(records: list[dict], decision: dict) -> str | None:
+    """Ensure the investigator actually consumes the visual analyst's message."""
+    if not records or str(decision.get("status", "")).lower() != "answer":
+        return None
+    geometry = records[-1].get("occlusion_json") or {}
+    visibility = geometry.get("target_support_visibility") or {}
+    affecting_edges = [
+        edge for edge in geometry.get("occlusion_edges") or []
+        if isinstance(edge, dict) and edge.get("could_affect_question") is True
+    ]
+    audit = (geometry.get("completeness_audit") or
+             geometry.get("observer_claim_audit") or {})
+    incomplete = (
+        visibility.get("complete_from_this_pose") is False or
+        audit.get("completeness_supported_by_pixels") is False or
+        audit.get("agrees_with_completeness") is False
+    )
+    hidden_regions = visibility.get("hidden_regions") or []
+    if incomplete:
+        hidden = ([str(edge.get("hides", "hidden region"))
+                   for edge in affecting_edges[:4]] or
+                  [str(region) for region in hidden_regions[:4]] or
+                  [str(audit.get("specific_risk") or "unresolved hidden region")])
+        change = geometry.get("recommended_view_change") or {}
+        return (
+            "the monocular occlusion analyst identified answer-relevant regions "
+            f"hidden by visible opaque objects: {hidden}. Its recommended view "
+            f"change is {change}. Treat the current count as a lower bound, "
+            "communicate this hypothesis, and choose physical parallax")
     return None
 
 
 def zoom_audit_prompt(question: str, zoom_result: list[dict]) -> str:
     guide = "\n".join(
-        f"Image {index + 1}: {item['target']} in {item['sectors']} "
-        f"({item['vertical']} band); purpose: {item['purpose']}"
+        f"Image {index + 1}: {item['target']}; source bbox "
+        f"{item['bbox_norm']}; purpose: {item['purpose']}"
         for index, item in enumerate(zoom_result)
     )
     return f"""Image 0 is the complete panorama for context. The remaining
@@ -834,10 +1043,16 @@ pixels that distinguish it from overlapping neighbors. Inspect all visible
 sides and partially occluded backs or legs. Symmetry may direct attention but
 may not create an instance unsupported by pixels.
 
+Do not stop after finding a familiar or symmetric arrangement. First scan the
+entire crop in fixed left-to-right, top-to-bottom order and list every candidate,
+including large foreground instances and partially overlapping objects.
+Then deduplicate physical identities and count. Finally state which side of any
+opaque anchor remains invisible; a crop cannot certify that hidden side.
+
 Keep the audit under 700 words. End with exactly one JSON object:
 {{"visible_answer":<integer|string|null>,
   "instances":[{{"id":"I1","description":"<one physical instance>",
-    "sector":"S#","relation_to_anchor":"<side/position>",
+    "relation_to_anchor":"<side/position>",
     "distinguishing_pixels":"<how it is separate>",
     "confidence":"high|medium|low"}}],
   "anchor":"<support/group or none>",
@@ -882,7 +1097,7 @@ def sam_followup_prompt(question: str, decision: dict, sam_result: dict,
                         candidates: list[dict], sam_round: int) -> str:
     cluster_guide = "\n".join(
         f"Image {index + 1}: enlarged crop for {cluster['id']} "
-        f"({cluster['sector']}); colored box is SAM's proposed mask."
+        f"at pixel box {cluster['box']}; colored box is SAM's proposed mask."
         for index, cluster in enumerate(sam_result.get("clusters") or []))
     return f"""You asked the SAM visual-localization assistant questions about
 the same panorama. Image 0 is the marked full panorama. The remaining images
@@ -926,27 +1141,24 @@ selected_hypothesis_index, and action_utility.
 
 
 def revision_prompt(question: str, records: list[dict], rejected: dict,
-                    candidates: list[dict], coverage_stats: dict,
-                    issue: str, force_more_evidence: bool = False) -> str:
+                    candidates: list[dict], issue: str) -> str:
     stories = "\n\n".join(
-        f"OBSERVATION {r['iteration']}:\n{r['story']}" for r in records)
-    extra = ("A single panorama can omit tiny objects, so you MUST select an "
-             "additional viewpoint and may not answer in this revision."
-             if force_more_evidence else
-             "You may answer only if all credible answer-changing hypotheses "
-             "are resolved; otherwise select an additional viewpoint.")
-    return f"""A deterministic consistency gate rejected your decision.
+        f"OBSERVATION {r['iteration']}:\n{r['story']}\n\n"
+        f"BLIND TARGET AUDITOR:\n{r.get('target_audit', '(none)')}\n\n"
+        f"OCCLUSION ANALYST:\n{r.get('occlusion_analysis', '(none)')}"
+        for r in records)
+    return f"""A consistency check rejected your decision.
 
 REJECTION: {issue}
 
-Repair the reasoning, not just the JSON. If the rejection concerns an incomplete
-instance ledger, visible overlap, or structural audit, choose zoom for the
-relevant sectors before paying to move. If evidence is genuinely hidden, rank
-hypotheses by expected decision value. The first hypothesis with
-could_change_answer=true must be the one tested by selected_viewpoint_id. If it
-names S#, use a supplied directional candidate in that sector when available.
-A generic frontier is justified only after an explicit comparison shows it is
-more answer-relevant. {extra}
+Make exactly one correction. Do not restate the rejection, narrate a checklist,
+or describe what you are about to do. A malformed or incomplete instance ledger
+is a communication-format problem: reconstruct it from grounded prose without
+spending a zoom or movement action. If pixels are too small or overlapping,
+choose zoom. If an opaque anchor hides a relevant side, choose parallax motion.
+The first hypothesis with could_change_answer=true must be tested by
+selected_viewpoint_id. You may answer only if all credible answer-changing
+hypotheses are resolved.
 
 QUESTION: {question}
 
@@ -955,13 +1167,12 @@ GROUNDED STORIES:
 
 REJECTED DECISION: {json.dumps(rejected, indent=2)}
 
-COVERAGE: {json.dumps(coverage_stats, indent=2)}
-
 VIEWPOINTS: {json.dumps(candidates, indent=2)}
 
-Reason verbosely, then emit the complete investigator JSON schema again. Do not
-omit hypotheses, instance_ledger, structural_completeness, zoom_requests,
-counting bounds, selected_hypothesis_index, or action_utility.
+Return ONE JSON object only and stop. No markdown and no prose before or after
+it. Use the complete investigator schema and do not omit hypotheses,
+instance_ledger, structural_completeness, zoom_requests, sam_requests, counting
+bounds, selected_viewpoint_id, selected_hypothesis_index, or action_utility.
 """
 
 
@@ -976,9 +1187,9 @@ REJECTED DECISION:
 {json.dumps(rejected, indent=2)}
 
 The uncertainty is in pixels already visible in the panorama. Call the zoom
-tool now; do not answer and do not choose verify/explore or SAM. Select the
-smallest contiguous S0-S11 region that contains the complete anchor/support and
-all related instances. Return JSON only, without prose or a code fence, using
+tool now; do not answer and do not choose verify/explore or SAM. Select one
+normalized 0..1000 image box containing the complete anchor/support and all
+related instances. Return JSON only, without prose or a code fence, using
 these exact keys:
 {{
   "status":"zoom",
@@ -987,8 +1198,7 @@ these exact keys:
   "instance_ledger":<copy the current ledger>,
   "structural_completeness":<copy the current structural audit>,
   "zoom_requests":[{{
-    "sectors":"S#-S#",
-    "vertical":"upper|middle|lower|full",
+    "bbox_norm":[0,0,1000,1000],
     "target":"<complete visible group and anchor>",
     "purpose":"<overlap/continuation/count uncertainty to resolve>"
   }}],
@@ -999,11 +1209,29 @@ these exact keys:
 """
 
 
-def drive(candidate: dict, timeout_s: int = 45) -> str:
+def navigation_arrived(output: str) -> bool:
+    """Accept only an explicit <=15 cm arrival, never a substring match."""
+    if re.search(r"^status\s*:\s*arrived\s*$", output, re.I | re.M):
+        return True
+    return bool(re.search(r"^ARRIVED\s+in\b", output, re.M))
+
+
+def drive(candidate: dict, timeout_s: int = 60) -> str:
     x, y = candidate["xy"]
-    output = ros(f"python3 /tmp/send_waypoint.py {x:.3f} {y:.3f} 0 {timeout_s}",
-                 timeout_s + 45)
-    return output
+    # Route around furniture globally first. The previous direct waypoint call
+    # validated only the endpoint and wedged against the tea-table obstacle.
+    routed = ros(
+        f"python3 /tmp/far_bridge.py {x:.3f} {y:.3f} {timeout_s}",
+        timeout_s + 45)
+    if navigation_arrived(routed):
+        return routed
+    # FAR may declare its route converged a little outside the challenge's
+    # required 0.15 m radius. From that nearby pose, a short direct close is safe
+    # and gives waypointConverter the final precision it is designed for.
+    final = ros(
+        f"python3 /tmp/send_waypoint.py {x:.3f} {y:.3f} 0 20 0.15",
+        50)
+    return routed + "\n--- final 0.15 m approach ---\n" + final
 
 
 def write_json(path: Path, value) -> None:
@@ -1024,6 +1252,7 @@ def normalize_decision(value) -> dict:
         "bestevidence": "best_evidence",
         "hypotheses": "hypotheses",
         "instanceledger": "instance_ledger",
+        "memorycorrections": "memory_corrections",
         "structuralcompleteness": "structural_completeness",
         "zoomrequests": "zoom_requests",
         "zoomrequest": "zoom_requests",
@@ -1043,6 +1272,42 @@ def normalize_decision(value) -> dict:
             result[canonical] = item
         else:
             result[key] = item
+    # Qwen occasionally inserts spaces inside nested JSON keys (for example,
+    # "confiden ce"). Canonicalize the small schema-bearing subobjects so
+    # persistent memory does not silently lose an otherwise valid instance.
+    ledger_aliases = {
+        "id": "id", "description": "description",
+        "relationtoanchor": "relation_to_anchor", "confidence": "confidence",
+        "currentvisibility": "current_visibility",
+    }
+    normalized_ledger = []
+    for entry in result.get("instance_ledger") or []:
+        if not isinstance(entry, dict):
+            continue
+        clean = {}
+        for key, item in entry.items():
+            compact = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            clean[ledger_aliases.get(compact, key)] = item
+        if clean.get("id"):
+            clean["id"] = str(clean["id"]).strip()
+        normalized_ledger.append(clean)
+    if "instance_ledger" in result:
+        result["instance_ledger"] = normalized_ledger
+
+    structural = result.get("structural_completeness")
+    if isinstance(structural, dict):
+        structural_aliases = {
+            "anchor": "anchor",
+            "visiblesidesaudited": "visible_sides_audited",
+            "overlaporcontinuationrisk": "overlap_or_continuation_risk",
+            "auditcomplete": "audit_complete",
+            "auditcompleteness": "audit_complete",
+        }
+        result["structural_completeness"] = {
+            structural_aliases.get(
+                re.sub(r"[^a-z0-9]", "", str(key).lower()), key): item
+            for key, item in structural.items()
+        }
     return result
 
 
@@ -1053,16 +1318,55 @@ def main() -> int:
     parser.add_argument("--max-moves", type=int, default=2)
     parser.add_argument("--budget", type=float, default=300.0)
     parser.add_argument("--no-drive", action="store_true")
+    parser.add_argument("--live", action="store_true",
+                        help="stream images, prompts, tokens and actions to a dashboard")
+    parser.add_argument("--dashboard-port", type=int, default=8765)
     args = parser.parse_args()
+
+    # Compatibility entry point only.  The multi-role storyteller / target
+    # auditor / occlusion auditor / fusion experiment was less reliable than the
+    # original single-Qwen + SAM + lidar coverage loop (it confidently stopped
+    # at two of four cushions).  Keep this module's geometry helpers importable,
+    # but never launch that experimental agent chain.
+    restored = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "run_question.py"),
+        args.question,
+        "--budget", str(args.budget),
+        "--max-iters", str(max(12, args.max_moves + 1)),
+        "--story-output", args.output,
+    ]
+    if args.no_drive:
+        restored.append("--no-drive")
+    if args.live:
+        restored.extend(["--live", "--dashboard-port",
+                         str(args.dashboard_port)])
+    print("[mode] redirecting legacy story command to restored single-Qwen "
+          "coverage exploration", flush=True)
+    return subprocess.call(restored)
 
     run_dir = Path(args.output).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "question.txt").write_text(args.question + "\n")
+    live = LiveTrace(run_dir) if args.live else None
+
+    def emit(kind: str, **payload) -> None:
+        if live is not None:
+            live.emit(kind, payload)
+
+    if live is not None:
+        _, dashboard_url = launch_dashboard(run_dir, args.dashboard_port)
+        emit("run_start", question=args.question, output=str(run_dir),
+             max_moves=args.max_moves, budget_s=args.budget,
+             dashboard_url=dashboard_url)
+        print(f"[dashboard] {dashboard_url}", flush=True)
     install_helpers()
 
     print("[load] Qwen3-VL-8B via experiments/nav/agent.py", flush=True)
     qwen = VLMAgent(load_4bit=True)
     qwen.trace_dir = str(run_dir / "model_images")
+    if live is not None:
+        qwen.event_callback = live.emit
     started = time.time()
     records = []
     coverage = None
@@ -1073,8 +1377,16 @@ def main() -> int:
 
     for iteration in range(args.max_moves + 1):
         print(f"[capture] observation {iteration}", flush=True)
+        emit("stage", stage="capture", iteration=iteration,
+             message=f"Capturing panorama for observation {iteration}")
         snap = capture(run_dir, iteration)
         pose = snap["pose"]
+        if records and records[-1].get("movement"):
+            movement = records[-1]["movement"]
+            target = np.asarray(movement["candidate"]["xy"], float)
+            movement["landed_pose"] = pose.tolist()
+            movement["position_error_m"] = round(float(
+                np.linalg.norm(np.asarray(pose[:2], float) - target)), 3)
         if coverage is None:
             coverage = Coverage(pose[:2])
         accumulated_cloud = (snap["cloud"] if accumulated_cloud is None else
@@ -1085,55 +1397,111 @@ def main() -> int:
         coverage.update(snap["terrain"], snap["cloud"])
         coverage.mark_observed_from(pose[:2])
 
-        history_summary = "\n".join(
-            f"Observation {r['iteration']} at ({r['pose'][0]:.2f},{r['pose'][1]:.2f}): "
-            f"decision={r.get('decision', {}).get('status', 'pending')}"
-            for r in records
-        )
         messages = [
             {"role": "system", "content": [{"type": "text", "text": OBSERVER_SYSTEM}]},
             {"role": "user", "content": [
                 {"type": "image"},
-                {"type": "text", "text": observer_prompt(
-                    args.question, iteration, history_summary)},
+                {"type": "text", "text": observer_prompt(iteration)},
             ]},
         ]
         print("[observe] verbose full-panorama story", flush=True)
-        annotated = sector_overlay(snap["pil"])
-        annotated.save(snap["dir"] / "frame_sectors.png")
-        story = qwen._gen(messages, [annotated], max_new_tokens=4096,
+        panorama = snap["pil"]
+        emit("capture_complete", iteration=iteration, pose=pose.tolist(),
+             image=snap["dir"] / "frame.png",
+             message="Fresh 360-degree panorama captured")
+        story = qwen._gen(messages, [panorama], max_new_tokens=2400,
                           label="story_observer", tag=f"view_{iteration:02d}")
         story_path = run_dir / f"observation_{iteration:02d}.md"
         story_path.write_text(story + "\n")
+        target_messages = [
+            {"role": "system", "content": [
+                {"type": "text", "text": TARGET_AUDITOR_SYSTEM}]},
+            {"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": target_auditor_prompt(args.question)},
+            ]},
+        ]
+        print("[target audit] blind visible-instance inventory", flush=True)
+        target_audit = qwen._gen(
+            target_messages, [panorama], max_new_tokens=1200,
+            label="story_target_audit", tag=f"view_{iteration:02d}")
+        (run_dir / f"target_audit_{iteration:02d}.md").write_text(
+            target_audit + "\n")
+        geometry_messages = [
+            {"role": "system", "content": [
+                {"type": "text", "text": OCCLUSION_ANALYST_SYSTEM}]},
+            {"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": occlusion_analyst_prompt(
+                    args.question)},
+            ]},
+        ]
+        print("[geometry] monocular depth and occlusion graph", flush=True)
+        occlusion_analysis = qwen._gen(
+            geometry_messages, [panorama], max_new_tokens=1800,
+            label="story_occlusion", tag=f"view_{iteration:02d}")
+        (run_dir / f"occlusion_{iteration:02d}.md").write_text(
+            occlusion_analysis + "\n")
+        observer_json = _json(story)
+        if records and records[-1].get("movement"):
+            prior_movement = records[-1]["movement"]
+            arrival_audit = observer_json.get("arrival_audit") or {}
+            arrival_audit["position_error_m"] = prior_movement[
+                "position_error_m"]
+            arrival_audit["geometric_target_reached"] = (
+                prior_movement["position_error_m"] <= 0.20 and
+                prior_movement.get("arrived") is True)
+            observer_json["arrival_audit"] = arrival_audit
+            prior_movement["arrival_audit"] = arrival_audit
         record = {
             "iteration": iteration,
             "pose": pose.tolist(),
             "story": story,
-            "observer_json": _json(story),
+            "observer_json": observer_json,
+            "target_audit": target_audit,
+            "target_audit_json": _json(target_audit),
+            "occlusion_analysis": occlusion_analysis,
+            "occlusion_json": _json(occlusion_analysis),
             "image": str(snap["dir"] / "frame.png"),
         }
         records.append(record)
+        persistent_memory = persistent_scene_memory(records)
 
         viewpoints = safe_viewpoints(accumulated_terrain, pose, coverage)
         seconds_left = args.budget - (time.time() - started)
         investigate_messages = [
             {"role": "system", "content": [
                 {"type": "text", "text": INVESTIGATOR_SYSTEM}]},
-            {"role": "user", "content": [{"type": "text", "text":
-                investigator_prompt(args.question, records, coverage.stats(),
-                                    viewpoints, seconds_left)}]},
+            {"role": "user", "content": [
+                {"type": "image"},
+                {"type": "text", "text": investigator_prompt(
+                    args.question, records, viewpoints, seconds_left)},
+            ]},
         ]
         print("[investigate] answerability and next-best-view reasoning", flush=True)
-        reasoning = qwen._gen(investigate_messages, [], max_new_tokens=3072,
+        reasoning = qwen._gen(
+            investigate_messages, [panorama], max_new_tokens=3072,
                               label="story_investigator", tag=f"view_{iteration:02d}")
         (run_dir / f"investigation_{iteration:02d}.md").write_text(reasoning + "\n")
         decision = normalize_decision(_json(reasoning))
         # Run structural gates before tool execution so an overconfident answer
         # can be repaired into a zoom request in this same observation cycle.
-        pretool_issue = decision_consistency_issue(decision, viewpoints)
-        if pretool_issue and str(decision.get("status", "")).lower() == "answer":
+        pretool_issue = (
+            arrival_consistency_issue(records, decision) or
+            target_audit_consistency_issue(records, decision) or
+            occlusion_consistency_issue(records, decision) or
+            decision_consistency_issue(
+                decision, viewpoints, persistent_memory=persistent_memory))
+        zoom_repairable = (
+            pretool_issue and (
+                "visible counting evidence" in pretool_issue or
+                "independent pixel audit" in pretool_issue))
+        if (zoom_repairable and
+                str(decision.get("status", "")).lower() == "answer"):
             print(f"[consistency before tools] {pretool_issue}; requesting zoom-aware "
                   "revision", flush=True)
+            emit("gate_reject", iteration=iteration, issue=pretool_issue,
+                 rejected_decision=decision, phase="before_visual_tools")
             rejected_decision = decision
             pretool_messages = [
                 {"role": "system", "content": [
@@ -1185,7 +1553,7 @@ def main() -> int:
                 fresh_requests = []
                 for request in requests:
                     signature = (
-                        tuple(request["sector_numbers"]), request["vertical"],
+                        tuple(request["bbox_norm"]),
                         request["target"].lower(),
                     )
                     if signature not in seen_zoom_signatures:
@@ -1201,6 +1569,8 @@ def main() -> int:
 
                 print(f"[tool] Qwen requests {len(fresh_requests)} zoom crop(s), "
                       f"round {zoom_round + 1}/2", flush=True)
+                emit("tool_start", tool="zoom", iteration=iteration,
+                     round=zoom_round, requests=fresh_requests)
                 zoom_dir = run_dir / "zoom_tool"
                 zoom_dir.mkdir(parents=True, exist_ok=True)
                 zoom_crops = []
@@ -1226,6 +1596,9 @@ def main() -> int:
                     run_dir / f"zoom_result_{iteration:02d}_{zoom_round:02d}.json",
                     zoom_result,
                 )
+                emit("tool_result", tool="zoom", iteration=iteration,
+                     round=zoom_round, crops=[item["path"] for item in zoom_result],
+                     result=zoom_result)
                 previous_decision = decision
                 zoom_messages = [
                     {"role": "user", "content": (
@@ -1237,7 +1610,7 @@ def main() -> int:
                 print("[tool result] returning full panorama + zoom crops to Qwen",
                       flush=True)
                 zoom_audit = qwen._gen(
-                    zoom_messages, [annotated] + zoom_crops,
+                    zoom_messages, [panorama] + zoom_crops,
                     max_new_tokens=1600,
                     label="story_zoom_audit",
                     tag=f"view_{iteration:02d}_round_{zoom_round:02d}",
@@ -1294,6 +1667,8 @@ def main() -> int:
                     break
                 print(f"[tool] Qwen is asking SAM {len(requests)} localization "
                       f"question(s), round {sam_round + 1}/2", flush=True)
+                emit("tool_start", tool="SAM", iteration=iteration,
+                     round=sam_round, requests=requests)
                 try:
                     if sam_assistant is None:
                         from sam_assistant import SAMAssistant
@@ -1324,6 +1699,8 @@ def main() -> int:
                     run_dir / f"sam_result_{iteration:02d}_{sam_round:02d}.json",
                     sam_result,
                 )
+                emit("tool_result", tool="SAM", iteration=iteration,
+                     round=sam_round, result=sam_result)
                 sam_messages = [
                     {"role": "system", "content": [
                         {"type": "text", "text": INVESTIGATOR_SYSTEM}]},
@@ -1370,41 +1747,51 @@ def main() -> int:
             decision["answer"] = None
             decision["selected_viewpoint_id"] = None
             decision["visual_tool_step_limit_reached"] = True
-        force_more_evidence = unsafe_first_view_zero(
-            args.question, decision, iteration, coverage.stats())
         room_issue = unresolved_first_view_regions(
             args.question, decision, records)
-        issue = ("first-panorama zero is unsafe while small-object support "
-                 "surfaces or geometric coverage remain unresolved"
-                 if force_more_evidence else
-                 room_issue or decision_consistency_issue(
-                     decision, viewpoints, bool(zoom_exchanges)))
-        for revision_index in range(2):
+        issue = (room_issue or arrival_consistency_issue(records, decision) or
+                 target_audit_consistency_issue(records, decision) or
+                 occlusion_consistency_issue(records, decision) or
+                 decision_consistency_issue(
+                     decision, viewpoints, bool(zoom_exchanges),
+                     persistent_memory))
+        # Greedy decoding plus an unchanged prompt makes a second repair attempt
+        # reproduce the first almost byte-for-byte. That cost us another 67 s in
+        # the pillow run. One compact repair is useful; an identical retry is not.
+        for revision_index in range(1):
             if not issue:
                 break
             print(f"[consistency] {issue}; requesting revision "
-                  f"{revision_index + 1}/2", flush=True)
+                  f"{revision_index + 1}/1", flush=True)
+            emit("gate_reject", iteration=iteration, issue=issue,
+                 rejected_decision=decision,
+                 revision_index=revision_index + 1)
             revise_messages = [
                 {"role": "system", "content": [
                     {"type": "text", "text": INVESTIGATOR_SYSTEM}]},
                 {"role": "user", "content": [{"type": "text", "text":
                     revision_prompt(args.question, records, decision, viewpoints,
-                                    coverage.stats(), issue,
-                                    force_more_evidence)}]},
+                                    issue)}]},
             ]
-            revision = qwen._gen(revise_messages, [], max_new_tokens=1536,
+            revision = qwen._gen(
+                                 revise_messages, [], max_new_tokens=900,
                                  label="story_revision",
-                                 tag=f"view_{iteration:02d}_r{revision_index}")
+                                 tag=f"view_{iteration:02d}_r{revision_index}",
+                                 repetition_penalty=1.12,
+                                 no_repeat_ngram_size=8)
             (run_dir / f"revision_{iteration:02d}_{revision_index}.md").write_text(
                 revision + "\n")
             revised = normalize_decision(_json(revision))
             if revised:
                 decision = revised
-            force_more_evidence = False
             issue = (unresolved_first_view_regions(
                 args.question, decision, records) or
+                arrival_consistency_issue(records, decision) or
+                target_audit_consistency_issue(records, decision) or
+                occlusion_consistency_issue(records, decision) or
                 decision_consistency_issue(
-                    decision, viewpoints, bool(zoom_exchanges)))
+                    decision, viewpoints, bool(zoom_exchanges),
+                    persistent_memory))
         if issue:
             # Never execute or stop on a decision that failed the gate. The
             # geometry fallback below can still select a safe point.
@@ -1412,15 +1799,11 @@ def main() -> int:
             decision["status"] = "explore"
             decision["answer"] = None
             decision["consistency_failure"] = issue
-            unresolved = _first_unresolved_hypothesis(decision)
-            target_sectors = _sector_numbers(unresolved[1]) if unresolved else set()
-            aligned = next((v for v in viewpoints
-                            if v.get("kind") == "directional_inspection"
-                            and str(v.get("panorama_sector", ""))[1:].isdigit()
-                            and int(str(v["panorama_sector"])[1:]) in target_sectors),
-                           None)
-            decision["selected_viewpoint_id"] = (
-                aligned["id"] if aligned else decision.get("selected_viewpoint_id"))
+            # Keep any valid model-selected viewpoint. If the response did not
+            # contain one, the geometry-only fallback below chooses safely.
+            selected = str(decision.get("selected_viewpoint_id") or "")
+            if not any(v["id"] == selected for v in viewpoints):
+                decision["selected_viewpoint_id"] = None
         record["decision"] = decision
         record["investigation"] = reasoning
         record["candidates"] = viewpoints
@@ -1431,6 +1814,8 @@ def main() -> int:
 
         status = str(decision.get("status", "")).lower()
         print(f"[decision] {json.dumps(decision, indent=2)}", flush=True)
+        emit("decision", iteration=iteration, decision=decision,
+             candidate_viewpoints=viewpoints)
         if status == "answer" and decision.get("answer") is not None:
             final_decision = decision
             break
@@ -1449,8 +1834,23 @@ def main() -> int:
             break
         print(f"[move] {candidate['id']} -> {candidate['xy']} "
               f"for {decision.get('semantic_goal', 'additional evidence')}", flush=True)
+        emit("movement_start", iteration=iteration, candidate=candidate,
+             semantic_goal=decision.get("semantic_goal", "additional evidence"),
+             expected_observation=decision.get("expected_observation", ""))
         movement = drive(candidate)
         (run_dir / f"movement_{iteration:02d}.log").write_text(movement)
+        record["movement"] = {
+            "from_pose": pose.tolist(),
+            "candidate": candidate,
+            "commanded_pose": [candidate["xy"][0], candidate["xy"][1]],
+            "semantic_goal": decision.get("semantic_goal", "additional evidence"),
+            "expected_observation": decision.get("expected_observation", ""),
+            "navigation_log": movement,
+            "arrived": navigation_arrived(movement),
+        }
+        emit("movement_complete", iteration=iteration, candidate=candidate,
+             arrived=navigation_arrived(movement), navigation_log=movement)
+        write_json(run_dir / "state.json", records)
 
     if final_decision is None:
         messages = [
@@ -1467,6 +1867,8 @@ def main() -> int:
 
     write_json(run_dir / "final_answer.json", final_decision)
     qwen.dump_trace(str(run_dir / "model_trace.json"))
+    emit("run_complete", answer=final_decision,
+         elapsed_s=round(time.time() - started, 1))
     print(f"[result] {json.dumps(final_decision, indent=2)}", flush=True)
     print(f"[saved] {run_dir}", flush=True)
     return 0
