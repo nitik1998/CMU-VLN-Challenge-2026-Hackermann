@@ -26,3 +26,31 @@ experiments/nav/timing_snap/
 experiments/nav/*.json
 experiments/japanese_room/*.png
 experiments/sam3/*.png
+
+# One-off capture/run output directories (frame.png, cloud_map.npy, pose.npz,
+# etc. from capture() calls) -- generated per-run, not source. Named by
+# whatever tag the calling script passed, so this is a broad set of prefixes
+# rather than an exhaustive list.
+experiments/nav/bench_*/
+experiments/nav/benchmark_panoramas/
+experiments/nav/closed_loop_cushion_test/
+experiments/nav/dining_check*/
+experiments/nav/fine_voxel_close/
+experiments/nav/hotel_bedside_*/
+experiments/nav/hotel_far/
+experiments/nav/hotel_room_1_*/
+experiments/nav/japanese_*/
+experiments/nav/loop_pose*/
+experiments/nav/multipose_scan_*/
+experiments/nav/office2_*/
+experiments/nav/pillow_dense_*/
+experiments/nav/probe[0-9]*/
+experiments/nav/random_office2_*/
+experiments/nav/refer_*/
+experiments/nav/scan[0-9]*/
+experiments/nav/scan_*/
+experiments/nav/semcompare/
+experiments/nav/sol_*/
+experiments/nav/step3b_*/
+experiments/nav/unified_pillow_*/
+experiments/nav/*.npy
