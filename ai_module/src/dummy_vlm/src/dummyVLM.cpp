@@ -34,6 +34,9 @@ string question;
 
 shared_ptr<rclcpp::Node> nh;
 
+rclcpp::Publisher<std_msgs::msg::String>::SharedPtr chainOfThoughtPub;
+std_msgs::msg::String chainOfThoughtMsg;
+
 // reading waypoints from file function
 void readWaypointFile()
 {
@@ -226,6 +229,15 @@ void pubNumericalAnswer(
   numericalAnswerPub->publish(numericalResponseMsg);
 }
 
+void pubChainOfThought(
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr& cotPub,
+  std_msgs::msg::String& cotMsg,
+  const std::string& text)
+{
+  cotMsg.data = text;
+  cotPub->publish(cotMsg);
+}
+
 // vehicle pose callback function
 void poseHandler(const nav_msgs::msg::Odometry::ConstSharedPtr pose)
 {
@@ -237,6 +249,7 @@ void poseHandler(const nav_msgs::msg::Odometry::ConstSharedPtr pose)
 void questionHandler(const std_msgs::msg::String::ConstSharedPtr msg)
 {
   RCLCPP_INFO(nh->get_logger(), "Received question");
+  pubChainOfThought(chainOfThoughtPub, chainOfThoughtMsg, "Received question: \"" + msg->data + "\"");
   question = msg->data;
 }
 
@@ -259,11 +272,13 @@ int main(int argc, char** argv)
   auto waypointPub = nh->create_publisher<geometry_msgs::msg::Pose2D>("/way_point_with_heading", 5);
   geometry_msgs::msg::Pose2D waypointMsgs;
 
-  auto objectMarkerPub = nh->create_publisher<visualization_msgs::msg::Marker>("selected_object_marker", 5);
+  auto objectMarkerPub = nh->create_publisher<visualization_msgs::msg::Marker>("/selected_object_marker", 5);
   visualization_msgs::msg::Marker objectMarkerMsgs;
 
   auto numericalAnswerPub = nh->create_publisher<std_msgs::msg::Int32>("/numerical_response", 5);
   std_msgs::msg::Int32 numericalResponseMsg;
+
+  chainOfThoughtPub = nh->create_publisher<std_msgs::msg::String>("/vlm_chain_of_thought", 5);
 
   // read waypoints from file
   readWaypointFile();
@@ -287,22 +302,30 @@ int main(int argc, char** argv)
 
     if (question.rfind("Find", 0) == 0 || question.rfind("find", 0) == 0) {
       RCLCPP_INFO(nh->get_logger(), "Marking and navigating to object.");
+      pubChainOfThought(chainOfThoughtPub, chainOfThoughtMsg,
+        "Classified as object-reference question. Marking and navigating to object \"" + objLabel + "\".");
       pubObjectMarker(objectMarkerPub, objectMarkerMsgs);
       pubObjectWaypoint(waypointPub, waypointMsgs);
     } else if (question.rfind("How many", 0) == 0 || question.rfind("how many", 0) == 0) {
       delObjectMarker(objectMarkerPub, objectMarkerMsgs);
       int32_t number = (rand() % 10) + 1;
       RCLCPP_INFO(nh->get_logger(), "%d", number);
+      pubChainOfThought(chainOfThoughtPub, chainOfThoughtMsg,
+        "Classified as numerical question. Answer: " + std::to_string(number));
       pubNumericalAnswer(numericalAnswerPub, numericalResponseMsg, number);
     } else {
       delObjectMarker(objectMarkerPub, objectMarkerMsgs);
       RCLCPP_INFO(nh->get_logger(), "Navigation starts.");
+      pubChainOfThought(chainOfThoughtPub, chainOfThoughtMsg,
+        "Classified as instruction-following question. Navigation starts.");
       pubPathWaypoints(waypointPub, waypointMsgs, rate);
       RCLCPP_INFO(nh->get_logger(), "Navigation ends.");
+      pubChainOfThought(chainOfThoughtPub, chainOfThoughtMsg, "Navigation ends.");
     }
 
     question.clear();
     RCLCPP_INFO(nh->get_logger(), "Awaiting question...");
+    pubChainOfThought(chainOfThoughtPub, chainOfThoughtMsg, "Awaiting question...");
     status = rclcpp::ok();
   }
 
